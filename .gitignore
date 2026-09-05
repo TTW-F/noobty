@@ -1,0 +1,18 @@
+# Rust
+target/
+
+# Node / web
+node_modules/
+dist/
+
+# Real config & runtime data (environment-specific, never publish)
+config.toml
+data/
+
+# Local ops notes (real IPs, SSH aliases, server facts) — never publish
+deploy/local.md
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,15 @@
+[Unit]
+Description=Noobty hub (self-hosted LAN transfer hub)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/noobty
+ExecStart=/opt/noobty/server/target/release/noobty-server
+Environment=NOOBTY_CONFIG=/opt/noobty/config.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
