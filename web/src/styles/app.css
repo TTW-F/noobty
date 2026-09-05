@@ -1,0 +1,249 @@
+/* Noobty 设计令牌 — 见根目录 DESIGN.md */
+@import 'tailwindcss';
+
+/* ---------------------------------------------------------------- */
+/* 主题变量(运行时切换):亮色为默认 */
+/* ---------------------------------------------------------------- */
+:root {
+  --bg: oklch(1 0 0);
+  --surface: oklch(0.965 0.005 220);
+  --surface-2: oklch(0.925 0.008 220);
+  --line: oklch(0.9 0.01 220);
+  --ink: oklch(0.21 0.02 240);
+  --muted: oklch(0.47 0.025 230);
+  --primary: oklch(0.52 0.11 205);
+  --on-primary: oklch(1 0 0);
+  --primary-soft: oklch(0.95 0.03 205);
+  --primary-ink: oklch(0.42 0.1 205);
+  --danger: oklch(0.55 0.19 25);
+  --danger-soft: oklch(0.95 0.025 25);
+  --warning: oklch(0.62 0.13 70);
+  --warning-soft: oklch(0.96 0.04 85);
+
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  --bg: oklch(0.14 0 0);
+  --surface: oklch(0.19 0.012 230);
+  --surface-2: oklch(0.24 0.014 230);
+  --line: oklch(0.27 0.015 230);
+  --ink: oklch(0.92 0.008 220);
+  --muted: oklch(0.63 0.02 225);
+  --primary: oklch(0.82 0.09 205);
+  --on-primary: oklch(0.14 0 0);
+  --primary-soft: oklch(0.26 0.05 205);
+  --primary-ink: oklch(0.75 0.1 205);
+  --danger: oklch(0.7 0.16 25);
+  --danger-soft: oklch(0.26 0.05 25);
+  --warning: oklch(0.75 0.12 75);
+  --warning-soft: oklch(0.26 0.05 75);
+
+  color-scheme: dark;
+}
+
+/* 把运行时变量映射进 Tailwind */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-primary: var(--primary);
+  --color-on-primary: var(--on-primary);
+  --color-primary-soft: var(--primary-soft);
+  --color-primary-ink: var(--primary-ink);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+
+  --font-sans:
+    system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC',
+    'Noto Sans SC', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono:
+    'Geist Mono', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas,
+    monospace;
+
+  --radius-card: 10px;
+  --radius-bubble: 14px;
+}
+
+/* ---------------------------------------------------------------- */
+/* 基础样式 */
+/* ---------------------------------------------------------------- */
+@layer base {
+  html {
+    height: 100%;
+  }
+
+  body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overscroll-behavior: none;
+  }
+
+  #root {
+    height: 100dvh;
+  }
+
+  ::selection {
+    background: var(--primary-soft);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+
+  input,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  /* 触屏上消除点按高亮与长按菜单(传输工具的手感) */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* ---------------------------------------------------------------- */
+/* 动效:全部只动 transform / opacity;reduced-motion 全部退化 */
+/* ---------------------------------------------------------------- */
+@media (prefers-reduced-motion: no-preference) {
+  @keyframes nt-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes nt-fade {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes nt-pop {
+    from {
+      opacity: 0;
+      transform: scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes nt-rise {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes nt-drop {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* 连接中呼吸 — 全站唯一循环动画 */
+  @keyframes nt-breathe {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  .anim-in {
+    animation: nt-in 0.18s ease-out both;
+  }
+
+  .anim-fade {
+    animation: nt-fade 0.16s ease-out both;
+  }
+
+  .anim-pop {
+    animation: nt-pop 0.16s ease-out both;
+  }
+
+  .anim-rise {
+    animation: nt-rise 0.18s ease-out both;
+  }
+
+  .anim-drop {
+    animation: nt-drop 0.2s ease-out both;
+  }
+
+  .anim-breathe {
+    animation: nt-breathe 1.6s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 全局兑现:所有过渡与循环动画退化为瞬时 */
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+
+  .anim-breathe {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
+/* ---------------------------------------------------------------- */
+/* 工具类 */
+/* ---------------------------------------------------------------- */
+/* 等宽数字:大小 / 速度 / 时间戳 / 容量 */
+@utility num {
+  font-family: var(--font-mono);
+  font-feature-settings: 'tnum' 1;
+  letter-spacing: -0.01em;
+}
+
+/* 历史长列表的滚动性能 */
+@utility list-culling {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 64px;
+}

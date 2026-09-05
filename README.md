@@ -24,7 +24,7 @@ Sending a big archive over WeChat is slow and capped by size limits. On a LAN yo
 🚧 Work in progress. Scope and roadmap: [docs/requirements.md](docs/requirements.md) · domain glossary: [CONTEXT.md](CONTEXT.md) · architecture decisions: [docs/adr/](docs/adr/)
 
 - [x] M0 — monorepo skeleton, hub server skeleton, deployment plan
-- [ ] M1 — core: store-and-forward, private chats, text/file messages, progress, resumable uploads, history, presence
+- [x] M1 (backend) — hub server: store-and-forward, private chats, text/file messages, resumable (tus-style) uploads, HTTP-Range downloads, history with catch-up cursors, WebSocket presence & push, retention/quota sweeper. Web UI in progress.
 - [ ] M2 — streaming relay, lobby, multi-file/folder batches
 - [ ] M3 — Windows tray shell (notifications, auto-accept)
 - [ ] M4 — auth + optional WAN exposure; toolbox features
@@ -43,6 +43,14 @@ cd server && cargo run
 ```
 
 Configuration: copy [config.example.toml](config.example.toml) to `config.toml` and edit.
+
+Backend end-to-end check (boots a throwaway hub, asserts the whole M1 API):
+
+```bash
+scripts/smoke.sh
+```
+
+Architecture and layering rules: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · API contract: [docs/API.md](docs/API.md)
 
 ## Deployment (no Docker, no CI)
 

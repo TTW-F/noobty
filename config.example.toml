@@ -7,7 +7,7 @@ port = 7317
 # Directory containing the built web UI, served as static files
 web_dir = "web/dist"
 
-# Where stored (store-and-forward) files live
+# Hub database (SQLite) and stored files live under this directory
 storage_path = "data"
 
 # Retention for stored files, in days
@@ -16,3 +16,6 @@ retention_days = 5
 # Total storage cap for stored files, in bytes (default: 30 GiB).
 # When the cap is reached, the oldest-uploaded files are cleaned first.
 max_total_bytes = 32212254720
+
+# Advisory chunk size for resumable uploads; also the request body limit.
+chunk_size = 4194304

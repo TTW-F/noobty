@@ -1,97 +1,117 @@
-use std::net::SocketAddr;
+//! Hub binary entry point: wiring only — bootstrapping layers, the router,
+//! background maintenance and graceful shutdown. All behavior lives in the
+//! layers below.
 
-use axum::{routing::get, Json, Router};
-use serde::Deserialize;
-use tower_http::{services::ServeDir, trace::TraceLayer};
+mod api;
+mod blob;
+mod config;
+mod domain;
+mod error;
+mod realtime;
+mod repo;
+mod service;
+mod state;
+mod wire;
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{delete, get, post};
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Deserialize)]
-struct Config {
-    #[serde(default = "default_port")]
-    port: u16,
-    #[serde(default = "default_web_dir")]
-    web_dir: String,
-    #[serde(default = "default_storage_path")]
-    storage_path: String,
-    #[serde(default = "default_retention_days")]
-    retention_days: u32,
-    #[serde(default = "default_max_total_bytes")]
-    max_total_bytes: u64,
-}
-
-fn default_port() -> u16 {
-    7317
-}
-
-fn default_web_dir() -> String {
-    "web/dist".into()
-}
-
-fn default_storage_path() -> String {
-    "data".into()
-}
-
-fn default_retention_days() -> u32 {
-    5
-}
-
-fn default_max_total_bytes() -> u64 {
-    30 * 1024 * 1024 * 1024
-}
+use state::SharedState;
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
-    let cfg = load_config();
-    if let Err(e) = std::fs::create_dir_all(&cfg.storage_path) {
-        tracing::warn!("cannot create storage dir {}: {e}", cfg.storage_path);
-    }
+    let cfg = config::Config::load();
+    let state: SharedState = Arc::new(state::AppState::new(cfg).expect("failed to init state"));
+    service::maintenance::spawn_sweeper(state.clone());
 
     let app = Router::new()
-        .route("/api/healthz", get(healthz))
-        .fallback_service(ServeDir::new(&cfg.web_dir))
-        .layer(TraceLayer::new_for_http());
+        .route("/api/healthz", get(api::healthz))
+        .route("/api/devices/register", post(api::devices::register))
+        .route("/api/devices", get(api::devices::list_devices))
+        .route("/api/ws", get(api::ws::ws_handler))
+        .route(
+            "/api/conversations",
+            get(api::conversations::list_conversations),
+        )
+        .route(
+            "/api/conversations/{id}/texts",
+            post(api::conversations::post_text),
+        )
+        .route(
+            "/api/conversations/{id}/messages",
+            get(api::conversations::get_messages),
+        )
+        .route(
+            "/api/messages/{message_id}",
+            delete(api::conversations::delete_message),
+        )
+        .route("/api/uploads", post(api::uploads::create))
+        .route(
+            "/api/uploads/{upload_id}",
+            get(api::uploads::info).put(api::uploads::put_chunk),
+        )
+        .route(
+            "/api/uploads/{upload_id}/complete",
+            post(api::uploads::complete),
+        )
+        .route(
+            "/api/files/{file_id}",
+            get(api::files::download).delete(api::files::delete_file),
+        )
+        .route("/api/files/{file_id}/meta", get(api::files::meta))
+        .route("/api/storage", get(api::storage_info))
+        .fallback_service(ServeDir::new(&state.cfg.web_dir))
+        .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(state.cfg.chunk_size))
+        .with_state(state.clone());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], state.cfg.port));
     tracing::info!(
-        "noobty hub v{} listening on http://{addr} (web_dir={}, storage={}, retention={}d, cap={}B)",
-        env!("CARGO_PKG_VERSION"),
-        cfg.web_dir,
-        cfg.storage_path,
-        cfg.retention_days,
-        cfg.max_total_bytes
+        "noobty hub v{} listening on http://{addr}",
+        env!("CARGO_PKG_VERSION")
     );
-
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("failed to bind");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("failed to bind");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "ok": true,
-        "name": "noobty",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
-}
-
+/// Graceful shutdown on SIGTERM (systemd stop) or Ctrl+C.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
-}
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("ctrl_c handler installed");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("sigterm handler installed")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
-fn load_config() -> Config {
-    let path = std::env::var("NOOBTY_CONFIG").unwrap_or_else(|_| "config.toml".into());
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => toml::from_str(&raw).unwrap_or_else(|e| panic!("invalid config file {path}: {e}")),
-        Err(_) => {
-            tracing::warn!("config file {path} not found, using defaults");
-            toml::from_str("").expect("built-in defaults are valid")
-        }
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
+    tracing::info!("shutdown signal received");
 }

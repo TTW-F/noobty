@@ -1,23 +1,24 @@
-# Noobty API Contract (v1 draft)
+# Noobty API Contract (v1 — implemented, M1)
 
 > Backend-owned contract between the hub server (`server/`) and every client (web UI, tray shell). Frontend negotiates changes via issues/PRs.
+> Design rationale lives in [ARCHITECTURE.md](ARCHITECTURE.md) and the ADRs.
 >
-> Conventions: all endpoints under `http://<hub>:7317`; JSON bodies unless stated otherwise; errors return `{ "error": "<message>" }` with a 4xx/5xx status; v1 has **no auth** (LAN trust, see ADR-0001 context in requirements).
+> Conventions: all endpoints under `http://<hub>:7317`; JSON bodies unless stated otherwise; errors return `{ "error": "<message>" }` with a 4xx/5xx status (409 conflicts also carry structured fields); v1 has **no auth** (LAN trust) — the `X-Noobty-Device` header is an identity assertion, not a credential.
 
 ## Concepts (see CONTEXT.md)
 
 - **device** — a connected terminal. Identified by `device_id` (UUID, assigned by the hub on first registration) and a human `name`.
 - **conversation** — a message thread. `private:<device_id>` targets one device; `lobby` broadcasts to everyone (M2).
-- **message** — a unit of chat: `text`, `file`, or `file_group`.
+- **message** — a unit of chat: `text` or `file` (`file_group` lands in M2).
 - **transfer modes** — `stored` (lands on hub disk, picked up later) and `relay` (streamed through the hub in real time, M2).
 
 ## Identity & presence
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/devices/register` | Body `{ "name": "My-Laptop" }` → `{ "device_id": "...", "name": "..." }`. Re-registering with an existing name adopts the existing `device_id`. |
+| POST | `/api/devices/register` | Body `{ "name": "My-Laptop" }` → `201 { "device_id", "name" }`. Registering with an existing name adopts that device's identity (a reinstated client keeps its history). Name must be 1..=64 characters. |
 | GET | `/api/devices` | `[ { "device_id", "name", "online", "last_seen" } ]` |
-| GET | `/api/ws?device_id=<id>` | **WebSocket.** Presence + message push + relay transport signalling. Heartbeat: client sends `{"type":"ping"}`, server replies `{"type":"pong"}`. |
+| GET | `/api/ws?device_id=<id>` | **WebSocket.** Presence + event push. Unknown device → 404. Heartbeat: client sends `{"type":"ping"}`, server replies `{"type":"pong"}`. |
 
 ### WebSocket events (JSON, one object per frame)
 
@@ -28,61 +29,72 @@ Server → client:
 { "type": "presence", "device_id": "...", "online": true }
 { "type": "message", "message_id": "...", "conversation_id": "private:...", "from_device_id": "...", "created_at": "RFC3339",
   "kind": "text", "text": "..." }
-{ "type": "message", "...", "kind": "file", "file": { "file_id": "...", "name": "pkg.zip", "size": 1234567 },
-  "mode": "stored" }
-{ "type": "message", "...", "kind": "file_group", "files": [ /* file objects */ ] }
-{ "type": "transfer_progress", "transfer_id": "...", "message_id": "...", "bytes_done": 0, "bytes_total": 0 }  // relay mode, throttled
+{ "type": "message", "...", "kind": "file", "file": { "file_id": "...", "name": "pkg.zip", "size": 1234567 } }
 { "type": "message_acked", "message_id": "..." }
+{ "type": "message_deleted", "message_id": "...", "conversation_id": "..." }
+{ "type": "file_deleted", "file_id": "..." }
 ```
+
+Delivery semantics: **push is best-effort**. Each connection has a bounded outbound queue (128 events); a slow consumer is kicked and expected to reconnect and catch up via the history API (`after` cursor). Senders receive an echo of their own messages (server is the source of truth; clients reconcile by `message_id`). Duplicate sessions for one device: the newer connection replaces the older one (which gets closed).
 
 Client → server:
 
 ```jsonc
 { "type": "ping" }
-{ "type": "ack_message", "message_id": "..." }   // receiver persisted/displayed it
+{ "type": "ack_message", "message_id": "..." }   // receiver displayed/persisted it; sender is notified
 ```
 
-## Messaging (REST fallbacks + history)
+## Messaging
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/conversations/{id}/texts` | Body `{ "text": "..." }` → `message` object. Sender is the registered `device_id` (header `X-Noobty-Device`). |
-| GET | `/api/conversations` | List of conversations with last message + unread-ish counts. |
-| GET | `/api/conversations/{id}/messages?before=<message_id>&limit=50` | History, newest first. |
-| DELETE | `/api/messages/{message_id}` | Any device may delete (devices are equal). |
-| DELETE | `/api/files/{file_id}` | Deletes stored bytes + history entry. |
+| POST | `/api/conversations/{id}/texts` | Body `{ "text": "..." }` (1..=100000 chars) → `201` message view. Requires `X-Noobty-Device`. |
+| GET | `/api/conversations` | One thread per registered device: `[ { "conversation_id", "peer", "last_message": { message_id, created_at, kind, preview } \| null } ]` |
+| GET | `/api/conversations/{id}/messages?before=<id>&after=<id>&limit=` | History. Default: newest page, descending. `before=<id>`: page strictly older, descending. `after=<id>`: **catch-up cursor**, ascending — replay in order after a reconnect. `limit` clamped 1..=200 (default 50). |
+| DELETE | `/api/messages/{message_id}` | Any device may delete (devices are equal). Deleting a file message also deletes the stored bytes. → 204. Broadcasts `message_deleted` (+ `file_deleted`). |
 
-## Upload — store-and-forward, chunked & resumable
+Message view shape (REST + WS):
+
+```jsonc
+{ "message_id": "...", "conversation_id": "...", "from_device_id": "...", "created_at": "RFC3339",
+  "kind": "text", "text": "..." }
+{ "...", "kind": "file", "file": { "file_id": "...", "name": "...", "size": 0 } }
+```
+
+## Upload — tus-style sequential append, chunked & resumable
 
 | Method | Path | Description |
 | --- | --- | --- |
-| POST | `/api/uploads` | Body `{ "name": "pkg.zip", "size": 123, "sha256": "hex?" }` → `{ "upload_id", "file_id", "chunk_size": 4194304, "received_bytes": 0 }`. `received_bytes > 0` when resuming an existing upload (matched by `sha256` or by name+size). |
-| PUT | `/api/uploads/{upload_id}` | Raw binary body. Header `X-Noobty-Offset: <n>` (defaults to current `received_bytes`). Response `{ "received_bytes": n }`. Client may send chunks sequentially or in parallel ranges; hub records contiguous received ranges. |
-| POST | `/api/uploads/{upload_id}/complete` | Verifies size (+`sha256` if given) → `{ "file_id": "..." }`, and (optionally) body `{ "conversation_id": "private:...", "as_message": true }` to post the file as a message. |
-| GET | `/api/uploads/{upload_id}` | `{ "received_bytes", "chunk_size" }` — for resume after interruption. |
+| POST | `/api/uploads` | Body `{ "name", "size", "sha256?" }` → `201 { "upload_id", "file_id", "chunk_size", "received_bytes" }`. Name 1..=255 bytes, no path separators. `received_bytes > 0` when resuming a matching incomplete session (same device + name + size + sha256). Exceeding the storage cap → `507`. |
+| PUT | `/api/uploads/{upload_id}` | Raw binary body, `X-Noobty-Offset: <n>` **required** and must equal the server's authoritative `received_bytes` (default 4 MiB chunks; framework rejects larger bodies). Wrong offset → `409 { "error", "current_offset" }`. Another device's session → `403`. Response `{ "received_bytes": n }`. |
+| POST | `/api/uploads/{upload_id}/complete` | Verifies staged size (+ `sha256` if declared) → `201 { "file_id", "message"? }`. Body `{ "conversation_id", "as_message": true }` posts the file as a message. Only the owning device may complete. |
+| GET | `/api/uploads/{upload_id}` | `{ "upload_id", "file_id", "chunk_size", "size", "name", "received_bytes" }` — resume after interruption. |
+
+Guarantees: before each append the staging file is truncated to the authoritative offset (heals partial writes from aborted requests); bytes are fsynced before the metadata row claims them; the finished blob is promoted by atomic rename, so a visible file is always complete.
 
 ## Download
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/files/{file_id}` | Binary stream. `Content-Disposition` carries the original name. Supports standard `Range` requests (resumable download). |
+| GET | `/api/files/{file_id}` | Binary stream. `Content-Disposition` (ASCII fallback + RFC 5987 UTF-8 name). Full support for single-range `Range` requests (resumable download): `206` + `Content-Range`, unsatisfiable → `416` + `Content-Range: bytes */size`, malformed/foreign units → full `200`. |
 | GET | `/api/files/{file_id}/meta` | `{ "file_id", "name", "size", "uploaded_at", "expires_at" }` |
+| DELETE | `/api/files/{file_id}` | Removes bytes + metadata + referencing messages. → 204 (404 if unknown). Broadcasts `file_deleted`. |
 
-## Streaming relay (M2)
+## Storage policy
 
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | `/api/relays` | `{ "to_device_id": "...", "name", "size" }` → `{ "relay_id", "message_id" }`; receiver gets a `message` event with `mode: "relay"`. |
-| PUT | `/api/relays/{relay_id}` | Sender streams raw bytes. |
-| GET | `/api/relays/{relay_id}` | Receiver streams raw bytes (hub splices both ends; backpressure applies). If the receiver is gone, sender falls back to store-and-forward. |
-
-## Storage policy (hub-side, not callable)
-
-- Stored files expire after `retention_days` (default 5) and total storage is capped at `max_total_bytes` (default 30 GiB); when over cap, **oldest-uploaded first**. Both configurable via `config.toml`.
-- GET `/api/storage` → `{ "used_bytes", "max_total_bytes", "retention_days" }` (informational).
+- Stored files expire after `retention_days` (default 5); total storage is capped at `max_total_bytes` (default 30 GiB) — when over cap, **oldest-uploaded first**. A sweeper enforces both every 60 s. Usage counts committed files **and** in-flight upload bytes. All values configurable via `config.toml`.
+- GET `/api/storage` → `{ "used_bytes", "max_total_bytes", "retention_days" }`
 
 ## Health
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/healthz` | `{ "ok": true, "name": "noobty", "version": "..." }` |
+
+## Streaming relay (M2, not yet implemented)
+
+`POST /api/relays` → sender `PUT /api/relays/{id}` + receiver `GET /api/relays/{id}`; the hub splices both streams. Falls back to store-and-forward when the receiver is offline. Will be added with its own contract revision.
+
+## End-to-end verification
+
+`scripts/smoke.sh` boots a throwaway hub and asserts the whole M1 surface (registration, WS push without polling, resumable upload incl. 409/403 paths, sha256 round-trip, Range download, deletion cascades, quota accounting). CI for humans: run it after every backend change.

@@ -1,0 +1,18 @@
+{
+  "name": "Noobty",
+  "short_name": "Noobty",
+  "description": "局域网传输中枢:设备之间以聊天的方式互发文字与文件。",
+  "lang": "zh-CN",
+  "display": "standalone",
+  "start_url": "/",
+  "background_color": "#ffffff",
+  "theme_color": "#10728a",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
