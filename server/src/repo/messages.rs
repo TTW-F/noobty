@@ -10,7 +10,7 @@ use crate::domain::{Message, MessagePayload, StoredFile};
 use crate::error::Result;
 use crate::repo::Db;
 
-const BASE_SELECT: &str = "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, f.id, f.name, f.size
+const BASE_SELECT: &str = "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, m.acked_ms, f.id, f.name, f.size
             FROM messages m LEFT JOIN files f ON f.id = m.file_id";
 
 pub struct RemovedMessage {
@@ -25,9 +25,10 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
     let kind: String = r.get(3)?;
     let text: Option<String> = r.get(4)?;
     let created_ms: i64 = r.get(5)?;
-    let file_id: Option<String> = r.get(6)?;
-    let file_name: Option<String> = r.get(7)?;
-    let file_size: Option<i64> = r.get(8)?;
+    let acked_ms: Option<i64> = r.get(6)?;
+    let file_id: Option<String> = r.get(7)?;
+    let file_name: Option<String> = r.get(8)?;
+    let file_size: Option<i64> = r.get(9)?;
     let payload = match kind.as_str() {
         "text" => MessagePayload::Text(text.unwrap_or_default()),
         "file" => {
@@ -35,7 +36,7 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
                 // A file message always joins to its file row; cascade deletes
                 // keep this true, so hitting this arm means corruption.
                 return Err(rusqlite::Error::FromSqlConversionFailure(
-                    6,
+                    7,
                     rusqlite::types::Type::Text,
                     "file message without matching file row".into(),
                 ));
@@ -59,6 +60,7 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
         conversation_id,
         from_device_id,
         created_ms,
+        acked_ms,
         payload,
     })
 }
@@ -164,16 +166,41 @@ pub async fn page_after(
     .await
 }
 
-pub async fn last_for_conversation(db: &Db, conversation_id: String) -> Result<Option<Message>> {
+/// Persist a delivery acknowledgement so it survives the sender being
+/// offline — the WS event alone would lose it. Returns false when the
+/// message does not exist (e.g. ack racing a delete), which is not an error.
+pub async fn set_acked(db: &Db, message_id: String, now_ms: i64) -> Result<bool> {
     db.exec(move |c| {
-        c.query_row(
-            &format!(
-                "{BASE_SELECT} WHERE m.conversation_id = ?1 ORDER BY m.created_ms DESC, m.id DESC LIMIT 1"
-            ),
-            params![conversation_id],
-            map_message,
-        )
-        .optional()
+        Ok(c.execute(
+            "UPDATE messages SET acked_ms = ?2 WHERE id = ?1",
+            params![message_id, now_ms],
+        )? == 1)
+    })
+    .await
+}
+
+/// Newest message per conversation in ONE grouped query, using SQLite's
+/// documented bare-column-with-MAX idiom: bare columns come from the row
+/// that holds the maximum. Replaces a per-conversation query (N+1).
+pub async fn last_per_conversation(
+    db: &Db,
+    conversation_ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, Message>> {
+    let json = serde_json::to_string(&conversation_ids)
+        .map_err(|e| crate::error::Error::Internal(anyhow::anyhow!("serialize ids: {e}")))?;
+    db.exec(move |c| {
+        let mut stmt = c.prepare(&format!(
+            "{BASE_SELECT}, MAX(m.created_ms)
+             WHERE m.conversation_id IN (SELECT value FROM json_each(?1))
+             GROUP BY m.conversation_id"
+        ))?;
+        let rows = stmt
+            .query_map(params![json], map_message)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|m| (m.conversation_id.clone(), m))
+            .collect())
     })
     .await
 }

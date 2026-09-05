@@ -23,6 +23,8 @@ pub fn spawn_sweeper(st: SharedState) {
 
 async fn sweep(st: &SharedState) -> Result<()> {
     let now = now_ms();
+    purge_stale_uploads(st, now).await?;
+
     let expired = crate::repo::files::expired_ids(&st.db, now).await?;
     for file_id in &expired {
         purge_file(st, file_id).await?;
@@ -47,6 +49,24 @@ async fn sweep(st: &SharedState) -> Result<()> {
             victim.id
         );
         purge_file(st, &victim.id).await?;
+    }
+    Ok(())
+}
+
+/// Abandoned upload sessions hold reserved quota (in-flight bytes count
+/// toward the cap) and leave staging blobs on disk. Sessions untouched for
+/// `upload_ttl_hours` are treated as dead: row deleted, staging blob removed.
+async fn purge_stale_uploads(st: &SharedState, now_ms: i64) -> Result<()> {
+    let cutoff = now_ms - st.cfg.upload_ttl_ms();
+    let stale = crate::repo::uploads::expired(&st.db, cutoff).await?;
+    for session in &stale {
+        crate::repo::uploads::delete_row(&st.db, session.id.clone()).await?;
+        if let Err(e) = st.blobs.remove_staging(&session.id).await {
+            tracing::error!("upload {}: staging removal failed: {e:?}", session.id);
+        }
+    }
+    if !stale.is_empty() {
+        tracing::info!("sweeper: reaped {} stale upload session(s)", stale.len());
     }
     Ok(())
 }

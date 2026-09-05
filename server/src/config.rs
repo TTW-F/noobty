@@ -16,6 +16,10 @@ pub struct Config {
     /// framework-level body limit).
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
+    /// Upload sessions untouched for longer than this are swept (row +
+    /// staging blob), returning their reserved quota to the pool.
+    #[serde(default = "default_upload_ttl_hours")]
+    pub upload_ttl_hours: u64,
 }
 
 fn default_port() -> u16 {
@@ -42,6 +46,10 @@ fn default_chunk_size() -> usize {
     4 * 1024 * 1024
 }
 
+fn default_upload_ttl_hours() -> u64 {
+    24
+}
+
 impl Config {
     pub fn load() -> Config {
         let path = std::env::var("NOOBTY_CONFIG").unwrap_or_else(|_| "config.toml".into());
@@ -59,5 +67,10 @@ impl Config {
     /// Retention window in milliseconds, for `files.expires_ms`.
     pub fn retention_ms(&self) -> i64 {
         self.retention_days as i64 * 24 * 60 * 60 * 1000
+    }
+
+    /// Upload-session TTL in milliseconds.
+    pub fn upload_ttl_ms(&self) -> i64 {
+        self.upload_ttl_hours as i64 * 60 * 60 * 1000
     }
 }

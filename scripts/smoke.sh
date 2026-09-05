@@ -60,9 +60,16 @@ B=$(curl -s -X POST "$BASE/api/devices/register" -H 'content-type: application/j
 [ -n "$B" ] && pass "registered smoke-b" || fail "register smoke-b"
 
 # WS listener on B: events must be PUSHED by the hub (no polling anywhere).
+# Every received message is auto-acked so the sender-side ack can be verified.
 cat > "$TMP/ws_client.mjs" <<'EOF'
 const ws = new WebSocket(process.argv[2]);
-ws.onmessage = (e) => console.log("WS-EVENT", e.data);
+ws.onmessage = (e) => {
+  console.log("WS-EVENT", e.data);
+  const frame = JSON.parse(e.data);
+  if (frame.type === "message") {
+    ws.send(JSON.stringify({ type: "ack_message", message_id: frame.message_id }));
+  }
+};
 ws.onopen = () => ws.send(JSON.stringify({ type: "ping" }));
 setTimeout(() => process.exit(0), 9000);
 EOF
@@ -77,6 +84,9 @@ sleep 0.8
 grep -q '"type":"pong"' "$TMP/ws.log" && pass "application-level ping/pong" || fail "ping/pong"
 grep -q '"type":"hello"' "$TMP/ws.log" && pass "hello on connect" || fail "hello on connect"
 grep -q '"kind":"text"' "$TMP/ws.log" && pass "text message pushed" || fail "text message pushed"
+sleep 0.6
+ACKED=$(curl -s "$BASE/api/conversations/private:$B/messages?limit=5" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);const m=o.messages.find(m=>m.kind==='text');console.log(m?.acked_at ?? '')})")
+[ -n "$ACKED" ] && pass "ack persisted (acked_at in history, survives offline sender)" || fail "ack persisted"
 
 echo "== resumable upload (tus-style sequential append)"
 head -c 262144 /dev/urandom >"$TMP/blob.bin"

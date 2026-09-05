@@ -19,3 +19,7 @@ max_total_bytes = 32212254720
 
 # Advisory chunk size for resumable uploads; also the request body limit.
 chunk_size = 4194304
+
+# Upload sessions untouched for longer than this are swept (row + staging
+# blob), returning their reserved quota. In hours.
+upload_ttl_hours = 24

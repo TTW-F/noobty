@@ -139,3 +139,27 @@ pub async fn finalize(
     })
     .await
 }
+
+/// Sessions untouched for longer than the TTL are dead (client vanished);
+/// the sweeper deletes the row and its staging blob to release quota.
+pub async fn expired(db: &Db, cutoff_ms: i64) -> Result<Vec<UploadSession>> {
+    db.exec(move |c| {
+        let mut stmt = c.prepare(
+            "SELECT id, file_id, device_id, name, size, sha256, received_bytes FROM uploads
+             WHERE created_ms <= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff_ms], map_session)?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        Ok(rows)
+    })
+    .await
+}
+
+pub async fn delete_row(db: &Db, upload_id: String) -> Result<()> {
+    db.exec(move |c| {
+        c.execute("DELETE FROM uploads WHERE id = ?1", params![upload_id])
+            .map(|_| ())
+    })
+    .await
+}

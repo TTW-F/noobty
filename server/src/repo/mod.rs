@@ -29,8 +29,14 @@ impl Db {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        // WAL: concurrent readers with one writer. synchronous=NORMAL is the
+        // standard WAL pairing — commits don't fsync per-transaction (big
+        // write-throughput win); WAL semantics still keep the database
+        // corruption-free, only the last committed transactions may be lost
+        // on power failure.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
              PRAGMA busy_timeout=5000;
              PRAGMA foreign_keys=ON;",
         )?;
@@ -106,6 +112,13 @@ fn migrate(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_ms DESC, id DESC);
 
             PRAGMA user_version = 1;",
+        )?;
+    }
+    if version < 2 {
+        // v2: durable delivery acknowledgements.
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN acked_ms INTEGER;
+             PRAGMA user_version = 2;",
         )?;
     }
     Ok(())

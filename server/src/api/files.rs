@@ -29,7 +29,8 @@ pub async fn download(
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             file.seek(std::io::SeekFrom::Start(start)).await?;
             let len = end - start + 1;
-            let body = Body::from_stream(ReaderStream::new(file.take(len)));
+            // 64 KiB stream chunks: fewer syscalls per gigabyte than the 8 KiB default.
+            let body = Body::from_stream(ReaderStream::with_capacity(file.take(len), 64 * 1024));
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, "application/octet-stream")
@@ -41,7 +42,7 @@ pub async fn download(
                 .map_err(Error::from)
         }
         None => {
-            let body = Body::from_stream(ReaderStream::new(file));
+            let body = Body::from_stream(ReaderStream::with_capacity(file, 64 * 1024));
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/octet-stream")

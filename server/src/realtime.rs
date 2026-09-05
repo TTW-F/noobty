@@ -18,7 +18,7 @@ pub const CHANNEL_CAPACITY: usize = 128;
 /// What the registry hands to a connection's writer task.
 #[derive(Debug)]
 pub enum Outbound {
-    Event(Event),
+    Event(Box<Event>),
     /// Session is superseded or the consumer is too slow: close the socket;
     /// the client reconnects and catches up.
     Close,
@@ -84,7 +84,7 @@ impl Registry {
             let conns = self.conns.read().expect("registry lock poisoned");
             conns
                 .get(device_id)
-                .map(|c| c.tx.try_send(Outbound::Event(event)))
+                .map(|c| c.tx.try_send(Outbound::Event(Box::new(event))))
         };
         match outcome {
             Some(Ok(())) => true,
@@ -105,7 +105,7 @@ impl Registry {
             if Some(id.as_str()) == except {
                 continue;
             }
-            let _ = conn.tx.try_send(Outbound::Event(event.clone()));
+            let _ = conn.tx.try_send(Outbound::Event(Box::new(event.clone())));
         }
     }
 

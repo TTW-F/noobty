@@ -42,6 +42,7 @@ pub async fn post_text(
         conversation_id: conversation_id.to_string(),
         from_device_id: from_device_id.to_string(),
         created_ms: now_ms(),
+        acked_ms: None,
         payload: MessagePayload::Text(text),
     };
     repo::messages::insert(&st.db, &message).await?;
@@ -71,18 +72,26 @@ pub async fn history(
     }
 }
 
-/// One thread per registered device, each with its newest message.
+/// One thread per registered device, each with its newest message. The
+/// newest-per-conversation lookup is a single grouped query.
 pub async fn conversation_summaries(
     st: &SharedState,
 ) -> Result<Vec<(DeviceWithStatus, Option<Message>)>> {
     let devices = crate::service::devices::list(st).await?;
-    let mut out = Vec::with_capacity(devices.len());
-    for dws in devices {
-        let conversation_id = format!("private:{}", dws.device.id);
-        let last = repo::messages::last_for_conversation(&st.db, conversation_id).await?;
-        out.push((dws, last));
-    }
-    Ok(out)
+    let conversation_ids: Vec<String> = devices
+        .iter()
+        .map(|d| format!("private:{}", d.device.id))
+        .collect();
+    let last_by_conversation =
+        repo::messages::last_per_conversation(&st.db, conversation_ids).await?;
+    Ok(devices
+        .into_iter()
+        .map(|dws| {
+            let conversation_id = format!("private:{}", dws.device.id);
+            let last = last_by_conversation.get(&conversation_id).cloned();
+            (dws, last)
+        })
+        .collect())
 }
 
 /// Devices are equal: any registered device may delete any message.
@@ -104,17 +113,20 @@ pub async fn delete_message(st: &SharedState, message_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Receiver acknowledges display/persistence; the sender learns about it.
+/// Receiver acknowledges display/persistence. Persisted first so the ack
+/// survives the sender being offline (history carries `acked_at`); the WS
+/// event then gives the online sender immediate feedback.
 pub async fn ack(st: &SharedState, from_device_id: &str, message_id: &str) -> Result<()> {
-    if let Some(sender) = repo::messages::sender_of(&st.db, message_id.to_string()).await?
-        && sender != from_device_id
-    {
-        st.registry.push(
-            &sender,
-            Event::MessageAcked {
-                message_id: message_id.to_string(),
-            },
-        );
+    if let Some(sender) = repo::messages::sender_of(&st.db, message_id.to_string()).await? {
+        repo::messages::set_acked(&st.db, message_id.to_string(), now_ms()).await?;
+        if sender != from_device_id {
+            st.registry.push(
+                &sender,
+                Event::MessageAcked {
+                    message_id: message_id.to_string(),
+                },
+            );
+        }
     }
     Ok(())
 }

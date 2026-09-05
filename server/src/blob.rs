@@ -99,4 +99,13 @@ impl BlobStore {
             Err(e) => Err(Error::Internal(e.into())),
         }
     }
+
+    /// Remove an abandoned staging blob (its upload session was reaped).
+    pub async fn remove_staging(&self, upload_id: &str) -> Result<bool> {
+        match tokio::fs::remove_file(self.staging_path(upload_id)).await {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::Internal(e.into())),
+        }
+    }
 }

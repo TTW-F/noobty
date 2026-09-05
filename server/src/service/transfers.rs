@@ -126,7 +126,10 @@ where
         });
     }
 
-    let mut file = st.blobs.open_append_at(&session.id, offset).await?;
+    let file = st.blobs.open_append_at(&session.id, offset).await?;
+    // Buffer network-sized chunks into 256 KiB writes: far fewer syscalls
+    // per gigabyte without holding the whole chunk in memory.
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
     let mut stream = pin!(body);
     let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
@@ -140,7 +143,7 @@ where
         written += chunk.len() as u64;
     }
     file.flush().await?;
-    file.sync_all().await?;
+    file.get_ref().sync_all().await?;
 
     let received = offset + written;
     repo::uploads::set_received(&st.db, session.id.clone(), received).await?;
@@ -159,6 +162,17 @@ pub async fn complete_upload(
         Some(conv) => Some(crate::service::messaging::conversation_peer(st, conv).await?),
         None => None,
     };
+
+    // Serialise completion against in-flight appends: without this lock a
+    // concurrent PUT could keep writing to the staging file while it is
+    // renamed away (or fail verification mid-write).
+    if !st.blobs.try_lock_upload(&session.id) {
+        return Err(Error::Conflict {
+            message: "an append to this upload is in progress".into(),
+            current_offset: Some(session.received_bytes),
+        });
+    }
+    let _guard = UploadLockGuard::new(st, &session.id);
 
     st.blobs.ensure_staging(&session.id).await?;
     let staged = st.blobs.staged_len(&session.id).await?;
@@ -199,6 +213,7 @@ pub async fn complete_upload(
                     name: session.name.clone(),
                     size: session.size,
                 }),
+                acked_ms: None,
             };
             repo::uploads::finalize(&st.db, session.id.clone(), &entry, Some(&message)).await?;
             crate::service::messaging::emit_message(st, &message, peer, &session.device_id);

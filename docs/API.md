@@ -37,11 +37,15 @@ Server → client:
 
 Delivery semantics: **push is best-effort**. Each connection has a bounded outbound queue (128 events); a slow consumer is kicked and expected to reconnect and catch up via the history API (`after` cursor). Senders receive an echo of their own messages (server is the source of truth; clients reconcile by `message_id`). Duplicate sessions for one device: the newer connection replaces the older one (which gets closed).
 
+Heartbeat contract: clients **must** send an application-level `ping` at least every 60 s; the hub closes connections that send nothing for more than 90 s (dead peers without a TCP FIN cannot be detected otherwise). On reconnect: re-register (or reuse `device_id`), open the socket, then catch up with `after=<last seen message_id>`.
+
 Client → server:
 
 ```jsonc
 { "type": "ping" }
-{ "type": "ack_message", "message_id": "..." }   // receiver displayed/persisted it; sender is notified
+{ "type": "ack_message", "message_id": "..." }   // receiver displayed/persisted it;
+                                                 // persisted on the hub, so it survives
+                                                 // offline senders (visible as `acked_at`)
 ```
 
 ## Messaging
@@ -57,9 +61,11 @@ Message view shape (REST + WS):
 
 ```jsonc
 { "message_id": "...", "conversation_id": "...", "from_device_id": "...", "created_at": "RFC3339",
-  "kind": "text", "text": "..." }
+  "kind": "text", "text": "...", "acked_at": "RFC3339" }
 { "...", "kind": "file", "file": { "file_id": "...", "name": "...", "size": 0 } }
 ```
+
+`acked_at` appears once the receiver has acknowledged; it is persisted server-side, so a sender that was offline still learns the ack via history.
 
 ## Upload — tus-style sequential append, chunked & resumable
 
@@ -70,7 +76,7 @@ Message view shape (REST + WS):
 | POST | `/api/uploads/{upload_id}/complete` | Verifies staged size (+ `sha256` if declared) → `201 { "file_id", "message"? }`. Body `{ "conversation_id", "as_message": true }` posts the file as a message. Only the owning device may complete. |
 | GET | `/api/uploads/{upload_id}` | `{ "upload_id", "file_id", "chunk_size", "size", "name", "received_bytes" }` — resume after interruption. |
 
-Guarantees: before each append the staging file is truncated to the authoritative offset (heals partial writes from aborted requests); bytes are fsynced before the metadata row claims them; the finished blob is promoted by atomic rename, so a visible file is always complete.
+Guarantees: before each append the staging file is truncated to the authoritative offset (heals partial writes from aborted requests); bytes are fsynced before the metadata row claims them; the finished blob is promoted by atomic rename, so a visible file is always complete. Completion is serialised against in-flight appends (409 if a PUT is mid-stream). Sessions untouched for `upload_ttl_hours` (default 24) are swept — row deleted, staging blob removed, quota released.
 
 ## Download
 

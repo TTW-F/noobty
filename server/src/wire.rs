@@ -61,6 +61,9 @@ pub struct MessageView {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<FileMetaView>,
+    /// Present once the receiver has acknowledged the message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<String>,
 }
 
 impl From<&Message> for MessageView {
@@ -85,6 +88,7 @@ impl From<&Message> for MessageView {
             kind,
             text,
             file,
+            acked_at: m.acked_ms.map(ms_to_rfc3339),
         }
     }
 }

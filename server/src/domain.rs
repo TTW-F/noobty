@@ -33,6 +33,9 @@ pub struct Message {
     pub conversation_id: String,
     pub from_device_id: String,
     pub created_ms: i64,
+    /// Delivery acknowledgement timestamp. Persisted so an ack survives the
+    /// sender being offline; `None` until the receiver acknowledges.
+    pub acked_ms: Option<i64>,
     pub payload: MessagePayload,
 }
 

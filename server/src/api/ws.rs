@@ -1,6 +1,8 @@
 //! WebSocket adapter: the only module converting between transport frames
 //! and the semantic `wire::Event` / `realtime::Outbound` channel.
 
+use std::time::Duration;
+
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
@@ -13,6 +15,11 @@ use crate::realtime::Outbound;
 use crate::service;
 use crate::state::SharedState;
 use crate::wire::{ClientFrame, Event};
+
+/// A connection that sends nothing for this long is presumed dead (crashed
+/// machine, WiFi drop without FIN) and is closed; the client reconnects and
+/// catches up via history. Clients must ping at least every 60 s.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Deserialize)]
 pub struct WsQuery {
@@ -61,7 +68,7 @@ async fn handle_socket(socket: WebSocket, st: SharedState, dws: crate::domain::D
                 device_id: device.id.clone(),
                 devices: devices.into_iter().map(Into::into).collect(),
             };
-            let _ = tx.send(Outbound::Event(hello)).await;
+            let _ = tx.send(Outbound::Event(Box::new(hello))).await;
         }
         Err(e) => tracing::warn!("ws {}: hello list failed: {e:?}", device.id),
     }
@@ -73,17 +80,24 @@ async fn handle_socket(socket: WebSocket, st: SharedState, dws: crate::domain::D
         Some(&device.id),
     );
 
-    while let Some(frame) = stream.next().await {
-        match frame {
-            Ok(WsMessage::Text(text)) => {
+    loop {
+        // Idle timeout: any inbound frame (text, ping, pong, binary) resets
+        // the clock, so actively-pinging clients are never dropped.
+        match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
                 if let Err(e) = handle_inbound(&st, &device.id, &tx, text.as_str()).await {
                     tracing::warn!("ws inbound from {}: {e:?}", device.id);
                 }
             }
-            Ok(WsMessage::Close(_)) => break,
-            Ok(_) => {}
-            Err(e) => {
+            Ok(Some(Ok(WsMessage::Close(_)))) => break,
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => {
                 tracing::info!("ws {}: connection error: {e}", device.id);
+                break;
+            }
+            Ok(None) => break,
+            Err(_elapsed) => {
+                tracing::info!("ws {}: idle timeout, closing", device.id);
                 break;
             }
         }
@@ -113,7 +127,7 @@ async fn handle_inbound(
         .map_err(|e| Error::Validation(format!("bad frame: {e}")))?
     {
         ClientFrame::Ping => {
-            let _ = tx.send(Outbound::Event(Event::Pong)).await;
+            let _ = tx.send(Outbound::Event(Box::new(Event::Pong))).await;
         }
         ClientFrame::AckMessage { message_id } => {
             service::messaging::ack(st, device_id, &message_id).await?;
