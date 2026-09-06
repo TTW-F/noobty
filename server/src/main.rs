@@ -91,14 +91,83 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+
+    // Manual accept loop (same shape as axum::serve internally) for two
+    // things the stock Serve cannot express:
+    // 1. TCP_NODELAY per connection — chat pushes and relay signalling are
+    //    small writes; Nagle + delayed ACK can add up to ~200 ms latency.
+    // 2. Bounded shutdown: on the shutdown token the accept loop stops and
+    //    every connection gets up to 2 s to finish in-flight responses;
+    //    WebSocket handlers close explicitly (token + close frames), so
+    //    `systemctl restart` never waits behind an idle socket.
+    let mut shutdown_rx = state.shutdown.subscribe();
+    let accept_loop = async {
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((stream, _addr)) => {
+                            let _ = stream.set_nodelay(true);
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let app = app.clone();
+                            let shutdown_rx = shutdown_rx.clone();
+                            tokio::spawn(async move {
+                                // Bridge hyper's Request<Incoming> to the
+                                // Router (same conversion axum::serve does).
+                                let svc = tower::util::service_fn(
+                                    move |req: hyper::Request<hyper::body::Incoming>| {
+                                        let app = app.clone();
+                                        async move {
+                                            use tower::ServiceExt as _;
+                                            app.oneshot(req.map(axum::body::Body::new))
+                                                .await
+                                        }
+                                    },
+                                );
+                                let svc =
+                                    hyper_util::service::TowerToHyperService::new(svc);
+                                let builder = hyper_util::server::conn::auto::Builder::new(
+                                    hyper_util::rt::TokioExecutor::new(),
+                                );
+                                let conn =
+                                    builder.serve_connection_with_upgrades(io, svc);
+                                tokio::pin!(conn);
+                                let mut shutdown_rx = shutdown_rx;
+                                tokio::select! {
+                                    _ = &mut conn => {}
+                                    _ = shutdown_rx.changed() => {
+                                        let _ = tokio::time::timeout(
+                                            std::time::Duration::from_secs(2),
+                                            &mut conn,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => tracing::warn!("accept failed: {e}"),
+                    }
+                }
+                _ = shutdown_rx.changed() => break,
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = accept_loop => {},
+        _ = shutdown_signal(state.clone()) => {},
+    }
+    // Connections get up to 2 s of grace inside their own tasks; give them
+    // that room before the runtime tears everything down.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tracing::info!("hub stopped");
 }
 
-/// Graceful shutdown on SIGTERM (systemd stop) or Ctrl+C.
-async fn shutdown_signal() {
+/// Graceful shutdown on SIGTERM (systemd stop) or Ctrl+C. The signal
+/// triggers the shutdown token (WebSocket handlers wind down) and closes
+/// every live connection with a proper close frame, so clients reconnect to
+/// the replacement process and catch up via history.
+async fn shutdown_signal(state: SharedState) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -118,5 +187,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
-    tracing::info!("shutdown signal received");
+    tracing::info!("shutdown signal received; closing client connections");
+    state.shutdown.trigger();
+    state.registry.close_all();
 }

@@ -80,10 +80,19 @@ async fn handle_socket(socket: WebSocket, st: SharedState, dws: crate::domain::D
         Some(&device.id),
     );
 
+    let mut shutdown_rx = st.shutdown.subscribe();
     loop {
         // Idle timeout: any inbound frame (text, ping, pong, binary) resets
-        // the clock, so actively-pinging clients are never dropped.
-        match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+        // the clock, so actively-pinging clients are never dropped. Hub
+        // shutdown breaks the wait explicitly.
+        let next = tokio::select! {
+            next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()) => next,
+            _ = shutdown_rx.changed() => {
+                tracing::info!("ws {}: hub shutting down, closing", device.id);
+                break;
+            }
+        };
+        match next {
             Ok(Some(Ok(WsMessage::Text(text)))) => {
                 if let Err(e) = handle_inbound(&st, &device.id, &tx, text.as_str()).await {
                     tracing::warn!("ws inbound from {}: {e:?}", device.id);

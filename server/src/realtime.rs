@@ -115,4 +115,13 @@ impl Registry {
             let _ = conn.tx.try_send(Outbound::Close);
         }
     }
+
+    /// Close every live connection (hub shutdown). Clients receive a close
+    /// frame, reconnect to the replacement process and catch up via history.
+    pub fn close_all(&self) {
+        let mut conns = self.conns.write().expect("registry lock poisoned");
+        for (_, conn) in conns.drain() {
+            let _ = conn.tx.try_send(Outbound::Close);
+        }
+    }
 }
