@@ -88,6 +88,10 @@ async fn main() {
             post(api::conversations::post_file_group),
         )
         .route(
+            "/api/conversations/{id}/transfers/announce",
+            post(api::conversations::announce_transfer),
+        )
+        .route(
             "/api/conversations/{id}/messages",
             get(api::conversations::get_messages),
         )

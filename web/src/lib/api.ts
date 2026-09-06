@@ -208,6 +208,19 @@ export const api = {
       body: JSON.stringify({ file_ids: fileIds }),
     }),
 
+  /** 发送开始即通知对端(短暂卡片,不入库) */
+  announceTransfer: (
+    conversationId: ConversationId,
+    deviceId: string,
+    transferId: string,
+    files: { name: string; size: number }[],
+  ) =>
+    request<void>(`/api/conversations/${encodeURIComponent(conversationId)}/transfers/announce`, {
+      method: 'POST',
+      deviceId,
+      body: JSON.stringify({ transfer_id: transferId, files }),
+    }),
+
   createRelay: (deviceId: string, name: string, size: number, conversationId: ConversationId) =>
     request<RelayCreated>('/api/relays', {
       method: 'POST',

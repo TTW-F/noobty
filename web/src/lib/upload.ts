@@ -5,7 +5,9 @@ import { sha256 } from '@noble/hashes/sha2.js'
 import { bytesToHex } from '@noble/hashes/utils.js'
 import { api, type CompleteResp } from './api'
 
-const SHA256_MAX_BYTES = 128 * 1024 * 1024
+// Only hash small files for resume matching; skip on larger LAN transfers so we
+// don't read the whole file from disk before the first upload byte.
+const SHA256_MAX_BYTES = 8 * 1024 * 1024
 const MAX_RETRIES = 5
 
 export interface UploadProgress {

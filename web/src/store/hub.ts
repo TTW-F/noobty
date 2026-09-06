@@ -13,6 +13,11 @@ import { inShell, shellDownloadToDownloads } from '../lib/shell'
 import { sweepAbandonedOpfsSaves } from '../lib/saveStream'
 import { closeLightbox } from '../lib/lightbox'
 import { HubSocket, bindWsTabLeader } from '../lib/ws'
+import {
+  isDownloaded,
+  listDownloadedIds,
+  markDownloaded,
+} from '../lib/downloadedReceipts'
 import type {
   ConnectionState,
   ConversationId,
@@ -32,12 +37,12 @@ export interface Toast {
 
 export type DownloadState =
   | { status: 'downloading'; receivedBytes: number; totalBytes: number; speed: number }
-  | { status: 'saved' }
+  | { status: 'saved'; native?: boolean }
   | { status: 'error'; message: string }
 
 export type AppView = 'chats' | 'files'
 
-/** 文件仓库条目:来自 GET /api/files 的中枢寄存清单 */
+/** 文件仓库条目:来自 GET /api/files 的中枢文件库清单 */
 export interface LibraryEntry {
   file: FileRef
   deviceId: string
@@ -45,6 +50,15 @@ export interface LibraryEntry {
   mine: boolean
   uploadedAt: string
   expiresAt: string
+}
+
+/** 对端正在发送(尚未落成正式消息) */
+export interface IncomingTransfer {
+  transferId: string
+  fromDeviceId: string
+  conversationId: ConversationId
+  files: { name: string; size: number }[]
+  startedAt: number
 }
 
 /** 一个显示会话背后两条线程的分页游标(out = 我→对方,in = 我的收件箱) */
@@ -60,10 +74,16 @@ const PAGE = 25
 const MAX_MESSAGES_IN_MEMORY = 200
 /** 过期/已删文件标记上限,超出丢最旧键 */
 const MAX_DEAD_FILES = 64
-/** 下载终态(saved/error)保留时长后从 map 剔除,避免常驻堆积 */
-const DOWNLOAD_TERMINAL_TTL_MS = 8_000
+/** 仅 error 终态短时保留后剔除;已下载回执走 downloaded 持久化 */
+const DOWNLOAD_ERROR_TTL_MS = 12_000
 /** 窗口隐藏超过此时长后 park:丢掉消息窗与仓库(托盘关窗常挂着) */
 const HIDDEN_PARK_MS = 20_000
+
+function receiptsToMap(deviceId: string): Record<string, true> {
+  const out: Record<string, true> = {}
+  for (const id of listDownloadedIds(deviceId)) out[id] = true
+  return out
+}
 
 /** 侧栏摘要只需 kind/text/计数/时间;file_group 不挂全量 FileRef[] */
 function slimPreview(m: Message): Message {
@@ -128,7 +148,11 @@ interface HubState {
 
   uploads: TransferTask[]
   downloads: Record<string, DownloadState>
-  /** 已被删除/清理的寄存文件:对应文件卡显示"已过期或已删除"且不可再取件 */
+  /** 本机已下载回执(持久化);用于「已下载」展示,park 不擦 */
+  downloaded: Record<string, true>
+  /** 对端正在发送(WS transfer_started);真实消息到达后清除 */
+  incomingTransfers: IncomingTransfer[]
+  /** 已被删除/清理的文件:卡片显示不可再下 */
   deadFiles: Record<string, true>
   storage: StorageInfo | null
 
@@ -189,24 +213,41 @@ function disconnectSocket(): void {
 export const useHub = create<HubState>((set, get) => {
   // ---------- 内部工具 ----------
 
-  /** 下载终态限期剔除:托盘常驻时 downloads map 否则只增不减 */
+  /** 下载终态:已下载写入回执并保留 UI;error 短时后清掉 */
   function setDownloadTerminal(fileId: string, state: DownloadState): void {
     const prev = downloadClearTimers.get(fileId)
     if (prev) clearTimeout(prev)
+
+    if (state.status === 'saved') {
+      const me = get().me
+      if (me) markDownloaded(me.device_id, fileId)
+      set((s) => {
+        const nextDownloads = { ...s.downloads }
+        delete nextDownloads[fileId]
+        return {
+          downloads: nextDownloads,
+          downloaded: { ...s.downloaded, [fileId]: true },
+        }
+      })
+      return
+    }
+
     set((s) => ({ downloads: { ...s.downloads, [fileId]: state } }))
-    downloadClearTimers.set(
-      fileId,
-      setTimeout(() => {
-        downloadClearTimers.delete(fileId)
-        set((s) => {
-          const cur = s.downloads[fileId]
-          if (!cur || cur.status === 'downloading') return s
-          const next = { ...s.downloads }
-          delete next[fileId]
-          return { downloads: next }
-        })
-      }, DOWNLOAD_TERMINAL_TTL_MS),
-    )
+    if (state.status === 'error') {
+      downloadClearTimers.set(
+        fileId,
+        setTimeout(() => {
+          downloadClearTimers.delete(fileId)
+          set((s) => {
+            const cur = s.downloads[fileId]
+            if (!cur || cur.status === 'downloading') return s
+            const next = { ...s.downloads }
+            delete next[fileId]
+            return { downloads: next }
+          })
+        }, DOWNLOAD_ERROR_TTL_MS),
+      )
+    }
   }
 
   function clearDownloadEntry(fileId: string): void {
@@ -278,7 +319,7 @@ export const useHub = create<HubState>((set, get) => {
     evictInactiveCaches(null)
     closeLightbox()
 
-    // 丢掉失败/已完成的上传任务(其 .file 会钉住多 GiB 的 File 句柄);进行中的保留
+    // 进行中下载保留;已下载回执在 downloaded 持久化层,此处不擦
     set((s) => {
       const downloads: typeof s.downloads = {}
       for (const [id, d] of Object.entries(s.downloads)) {
@@ -840,6 +881,18 @@ export const useHub = create<HubState>((set, get) => {
         // 供断线补拉(after 游标)按线程取最新
         upsertMessage(m)
         const bucket = uiConvKey(m.conversation_id, m.from_device_id)
+        // 正式文件消息到达 → 清掉同会话的「正在发送」临时卡片
+        if (m.kind === 'file' || m.kind === 'file_group') {
+          set((s) => ({
+            incomingTransfers: s.incomingTransfers.filter(
+              (t) =>
+                !(
+                  t.conversationId === bucket &&
+                  t.fromDeviceId === m.from_device_id
+                ),
+            ),
+          }))
+        }
         bumpUnread(bucket, m.from_device_id)
         ack(m)
         // 托盘壳增强:系统通知 + 文件自动接收(仅他人消息)。
@@ -847,6 +900,7 @@ export const useHub = create<HubState>((set, get) => {
         if (m.from_device_id !== get().me?.device_id) {
           const viewingNow = document.hasFocus() && bucket === get().activeConv
           const sender = get().devices.find((d) => d.device_id === m.from_device_id)
+          const meId = get().me?.device_id
           void onIncomingMessage(
             {
               senderName: sender?.name ?? '局域网设备',
@@ -855,8 +909,19 @@ export const useHub = create<HubState>((set, get) => {
               file: m.file,
               files: m.files,
             },
-            { notify: !viewingNow },
-          )
+            { notify: !viewingNow, deviceId: meId },
+          ).then(() => {
+            if (!meId) return
+            const files =
+              m.kind === 'file' ? (m.file ? [m.file] : []) : (m.files ?? [])
+            const hit = files.filter((f) => isDownloaded(meId, f.file_id))
+            if (hit.length === 0) return
+            set((s) => {
+              const downloaded = { ...s.downloaded }
+              for (const f of hit) downloaded[f.file_id] = true
+              return { downloaded }
+            })
+          })
         }
         break
       }
@@ -904,6 +969,26 @@ export const useHub = create<HubState>((set, get) => {
       }
       case 'relay_offer': {
         acceptRelayOffer(frame)
+        break
+      }
+      case 'transfer_started': {
+        const bucket = uiConvKey(frame.conversation_id, frame.from_device_id)
+        set((s) => ({
+          incomingTransfers: [
+            ...s.incomingTransfers.filter((t) => t.transferId !== frame.transfer_id),
+            {
+              transferId: frame.transfer_id,
+              fromDeviceId: frame.from_device_id,
+              conversationId: bucket,
+              files: frame.files,
+              startedAt: Date.now(),
+            },
+          ],
+        }))
+        // 侧栏未读提示
+        if (get().activeConv !== bucket) {
+          set((s) => ({ unread: { ...s.unread, [bucket]: (s.unread[bucket] ?? 0) + 1 } }))
+        }
         break
       }
       default:
@@ -1075,6 +1160,8 @@ export const useHub = create<HubState>((set, get) => {
 
     uploads: [],
     downloads: {},
+    downloaded: {},
+    incomingTransfers: [],
     deadFiles: {},
     storage: null,
 
@@ -1084,7 +1171,7 @@ export const useHub = create<HubState>((set, get) => {
       hookVisibilityPark()
       const identity = loadIdentity()
       if (!identity) return
-      set({ me: identity })
+      set({ me: identity, downloaded: receiptsToMap(identity.device_id) })
       connectSocket(identity.device_id)
     },
 
@@ -1092,7 +1179,7 @@ export const useHub = create<HubState>((set, get) => {
       hookVisibilityPark()
       const identity = await api.registerDevice(name)
       saveIdentity(identity)
-      set({ me: identity })
+      set({ me: identity, downloaded: receiptsToMap(identity.device_id) })
       connectSocket(identity.device_id)
     },
 
@@ -1132,6 +1219,8 @@ export const useHub = create<HubState>((set, get) => {
         loadingMore: {},
         unread: {},
         downloads: {},
+        downloaded: {},
+        incomingTransfers: [],
         deadFiles: {},
         lobbySupported: null,
         activeConv: null,
@@ -1297,7 +1386,17 @@ export const useHub = create<HubState>((set, get) => {
       const me = get().me
       if (!me || files.length === 0) return
 
-      // 单文件:可走直转;多文件/文件夹:并发 tus 寄存后合成一条 file_group
+      const transferId = newId('xfer')
+      void api
+        .announceTransfer(
+          conv,
+          me.device_id,
+          transferId,
+          files.map((f) => ({ name: f.name, size: f.size })),
+        )
+        .catch(() => undefined)
+
+      // 单文件:可走直转;多文件/文件夹:并发 tus 入库后合成一条 file_group
       if (files.length === 1) {
         const f = files[0]!
         const task: TransferTask = {
@@ -1399,13 +1498,22 @@ export const useHub = create<HubState>((set, get) => {
         },
       }))
 
-      // 托盘壳:流式落到可配置接收目录(可写 D: 等),避免浏览器 OPFS/C 盘缓存。
+      const me = get().me
+
+      // 托盘壳:流式落到可配置接收目录
       if (inShell) {
-        const startedAt = Date.now()
+        const windowPts: Array<[number, number]> = []
         const controller = { cancelled: false }
         const promise = shellDownloadToDownloads(file, ({ received, total }) => {
           if (controller.cancelled) return
-          const elapsed = Math.max(0.25, (Date.now() - startedAt) / 1000)
+          const now = Date.now()
+          windowPts.push([now, received])
+          while (windowPts.length > 1 && now - windowPts[0]![0] > 3_000) windowPts.shift()
+          const first = windowPts[0]!
+          const speed =
+            windowPts.length > 1 && now > first[0]
+              ? ((received - first[1]) * 1000) / (now - first[0])
+              : 0
           set((s) => {
             const cur = s.downloads[file.file_id]
             if (!cur || cur.status !== 'downloading') return s
@@ -1416,13 +1524,14 @@ export const useHub = create<HubState>((set, get) => {
                   status: 'downloading',
                   receivedBytes: received,
                   totalBytes: total || file.size,
-                  speed: received / elapsed,
+                  speed,
                 },
               },
             }
           })
         }).then((path) => {
           if (!path) throw new Error('壳下载失败')
+          if (me) markDownloaded(me.device_id, file.file_id, { path })
         })
         const handle: DownloadHandle = {
           promise,
@@ -1468,7 +1577,9 @@ export const useHub = create<HubState>((set, get) => {
       downloadHandles.set(file.file_id, handle)
       handle.promise
         .then(() => {
-          setDownloadTerminal(file.file_id, { status: 'saved' })
+          if (me) markDownloaded(me.device_id, file.file_id)
+          setDownloadTerminal(file.file_id, { status: 'saved', native: handle.native })
+          if (handle.native) get().pushToast('ok', `${file.name}:已交给浏览器下载`)
         })
         .catch((err: unknown) => {
           if (isAbort(err)) {
@@ -1479,7 +1590,10 @@ export const useHub = create<HubState>((set, get) => {
             status: 'error',
             message: err instanceof Error ? err.message : '下载失败',
           })
-          get().pushToast('error', `${file.name}:下载失败`)
+          get().pushToast(
+            'error',
+            `${file.name}:${err instanceof Error ? err.message : '下载失败'}`,
+          )
         })
         .finally(() => downloadHandles.delete(file.file_id))
     },

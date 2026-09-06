@@ -88,7 +88,7 @@ export function sendFileBatch(
   const promise = (async (): Promise<CompleteResp> => {
     const fileIds: string[] = new Array(files.length)
     let next = 0
-    const workers = Math.min(2, files.length)
+    const workers = Math.min(4, files.length)
 
     const report = (speed: number, doneFiles: number) => {
       const sentBytes = perFile.reduce((a, b) => a + b, 0)
@@ -180,7 +180,7 @@ function putRelayWithProgress(
   })
 }
 
-/** 接收方实时拉取直转流(与 PUT tee 并行);失败时调用方改走普通取件。优先磁盘流式落盘。 */
+/** 接收方实时拉取直转流(与 PUT tee 并行);失败时调用方改走普通下载。优先磁盘流式落盘。 */
 export function receiveRelay(
   relayId: string,
   deviceId: string,
@@ -191,6 +191,10 @@ export function receiveRelay(
 
   const promise = (async () => {
     const sink = await openSaveSink(file.name, file.size)
+    if (!sink) {
+      // 直转需要带设备头的 fetch,无法走无头的原生 <a download>;交给调用方回落普通下载。
+      throw new Error('当前环境无法流式接收直转,请改用下载')
+    }
     const state = { received: 0, startedAt: Date.now(), totalBytes: file.size }
     try {
       const res = await fetch(api.relayUrl(relayId), {

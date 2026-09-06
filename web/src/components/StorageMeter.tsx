@@ -1,4 +1,4 @@
-// 寄存空间表:侧栏(可展开详情)与文件仓库(紧凑)共用
+// 存储空间表:侧栏(可展开详情)与文件库(紧凑)共用
 import { useState } from 'react'
 import { CaretDown, HardDrives, Warning } from '@phosphor-icons/react'
 import { useHub } from '../store/hub'
@@ -21,7 +21,7 @@ export function StorageMeter({ compact = false }: { compact?: boolean }) {
         <div className="mb-1.5 flex items-baseline justify-between gap-2">
           <span className="flex items-center gap-1.5 text-[12px] font-medium text-muted">
             <HardDrives size={13} />
-            寄存空间
+            存储空间
           </span>
           <span className={`num text-[11px] ${warn ? 'text-warning' : 'text-muted'}`}>
             {formatBytes(storage.used_bytes)} / {formatBytes(storage.max_total_bytes)}
@@ -38,7 +38,7 @@ export function StorageMeter({ compact = false }: { compact?: boolean }) {
         </div>
         <p className="mt-1.5 flex items-center gap-1 text-[11px] text-muted">
           {warn && <Warning size={11} className="shrink-0 text-warning" weight="fill" />}
-          寄存文件保留 {storage.retention_days} 天,到期自动清理
+          文件库保留 {storage.retention_days} 天,到期自动清理
         </p>
       </div>
     )
@@ -52,7 +52,7 @@ export function StorageMeter({ compact = false }: { compact?: boolean }) {
         className="flex w-full items-center gap-1.5 rounded text-left"
       >
         <HardDrives size={13} className="shrink-0 text-muted" />
-        <span className="flex-1 text-[12px] font-medium text-muted">寄存空间</span>
+        <span className="flex-1 text-[12px] font-medium text-muted">存储空间</span>
         <span className={`num text-[11px] ${warn ? 'text-warning' : 'text-muted'}`}>{percent}%</span>
         <CaretDown
           size={11}
@@ -87,7 +87,7 @@ export function StorageMeter({ compact = false }: { compact?: boolean }) {
             </div>
             <div className="flex items-baseline justify-between gap-3">
               <dt className="shrink-0 text-muted">保留期限</dt>
-              <dd className="text-right">寄存文件保留 {storage.retention_days} 天</dd>
+              <dd className="text-right">文件库保留 {storage.retention_days} 天</dd>
             </div>
             <div className="flex items-baseline justify-between gap-3">
               <dt className="shrink-0 text-muted">超出上限</dt>

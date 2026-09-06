@@ -7,14 +7,20 @@
 // - 壳窗口 disable_drag_drop_handler,系统文件拖拽以原生 HTML5 DnD 直达网页
 
 import type { FileRef } from './types'
+import { markDownloaded } from './downloadedReceipts'
 
 export const inShell: boolean =
   typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 
+interface TauriChannel<T> {
+  onmessage: ((msg: T) => void) | null
+  id?: number
+}
+
 interface TauriGlobals {
   core: {
     invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>
-    Channel?: new <T>(opts: { onMessage: (msg: T) => void }) => unknown
+    Channel?: new <T>() => TauriChannel<T>
   }
 }
 
@@ -80,6 +86,23 @@ export async function shellResetDownloadDir(): Promise<ShellDownloadDirInfo | nu
   }
 }
 
+function makeProgressChannel(
+  Channel: new () => TauriChannel<ShellDownloadProgress>,
+  onProgress?: (p: ShellDownloadProgress) => void,
+): TauriChannel<ShellDownloadProgress> {
+  const ch = new Channel()
+  ch.onmessage = (msg) => {
+    if (!onProgress || !msg) return
+    // Rust serde may send snake or camel; normalize.
+    const raw = msg as ShellDownloadProgress & { received_bytes?: number; total_bytes?: number }
+    onProgress({
+      received: Number(raw.received ?? raw.received_bytes ?? 0),
+      total: Number(raw.total ?? raw.total_bytes ?? 0),
+    })
+  }
+  return ch
+}
+
 /** 流式下载到壳配置的接收目录,返回落盘路径 */
 export async function shellDownloadToDownloads(
   file: FileRef,
@@ -93,11 +116,8 @@ export async function shellDownloadToDownloads(
     url: `${origin}/api/files/${encodeURIComponent(file.file_id)}`,
     name: file.name,
   }
-  // Channel 可选;不传时 Rust 端静默落盘(自动接收路径)
   if (typeof Channel === 'function') {
-    args.onProgress = new Channel<ShellDownloadProgress>({
-      onMessage: onProgress ?? (() => undefined),
-    })
+    args.onProgress = makeProgressChannel(Channel, onProgress)
   }
   try {
     const path = await invoke('download_to', args)
@@ -120,7 +140,8 @@ export async function shellAutoAcceptEnabled(): Promise<boolean> {
 }
 
 /** 收到新消息时的壳内增强:系统通知 + (文件消息)自动接收。
- * `notify` 为 false 时仍可自动落盘(用户正看着该会话时不弹打扰通知)。 */
+ * `notify` 为 false 时仍可自动落盘(用户正看着该会话时不弹打扰通知)。
+ * `deviceId` 用于写入本机已下载回执。 */
 export async function onIncomingMessage(
   info: {
     senderName: string
@@ -129,7 +150,7 @@ export async function onIncomingMessage(
     file?: FileRef
     files?: FileRef[]
   },
-  opts: { notify?: boolean } = {},
+  opts: { notify?: boolean; deviceId?: string } = {},
 ): Promise<void> {
   if (!inShell) return
   const notify = opts.notify !== false
@@ -148,9 +169,10 @@ export async function onIncomingMessage(
     for (const f of files) {
       const path = await shellDownloadToDownloads(f)
       if (path) {
+        if (opts.deviceId) markDownloaded(opts.deviceId, f.file_id, { path })
         if (notify) void shellNotify('已自动保存', `${f.name} → ${path}`)
       } else {
-        void shellNotify('自动接收失败', `${f.name}:请打开 Noobty 手动取件`)
+        void shellNotify('自动接收失败', `${f.name}:请打开 Noobty 手动下载`)
       }
     }
   }

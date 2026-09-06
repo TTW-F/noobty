@@ -43,7 +43,9 @@ fn default_max_total_bytes() -> u64 {
 }
 
 fn default_chunk_size() -> usize {
-    4 * 1024 * 1024
+    // LAN: larger chunks → fewer HTTP round-trips. Loopback was ~376 MiB/s at 4 MiB;
+    // 16 MiB cuts request count 4× for multi‑GiB archives.
+    16 * 1024 * 1024
 }
 
 fn default_upload_ttl_hours() -> u64 {

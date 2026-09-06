@@ -14,13 +14,43 @@ import { useHub } from '../store/hub'
 import { Button, EmptyState, IconButton, PresenceDot, Skeleton } from './ui'
 import { MessageRow } from './messages'
 import { Composer } from './Composer'
-import { formatDayLabel, formatRelative } from '../lib/format'
+import { formatBytes, formatDayLabel, formatRelative } from '../lib/format'
 import { filesFromDataTransfer } from '../lib/pick'
 import type { ConversationId, Message } from '../lib/types'
 
 const GROUP_WINDOW_MS = 3 * 60_000
 /** Virtuoso prepend 基准:加载更早时向下递减,避免重排已渲染项 */
 const VIRT_START = 100_000
+
+function IncomingTransferBanner({ conv }: { conv: ConversationId }) {
+  const transfers = useHub(
+    useShallow((s) => s.incomingTransfers.filter((t) => t.conversationId === conv)),
+  )
+  const devices = useHub((s) => s.devices)
+  if (transfers.length === 0) return null
+  return (
+    <div className="shrink-0 space-y-1 border-b border-line bg-primary-soft/40 px-4 py-2">
+      {transfers.map((t) => {
+        const name = devices.find((d) => d.device_id === t.fromDeviceId)?.name ?? '对方'
+        const total = t.files.reduce((s, f) => s + f.size, 0)
+        const label =
+          t.files.length === 1
+            ? t.files[0]!.name
+            : `${t.files.length} 个文件（${formatBytes(total)}）`
+        return (
+          <div key={t.transferId} className="flex items-center gap-2 text-[12.5px] text-ink">
+            <span className="inline-flex animate-spin text-primary">
+              <CircleNotch size={14} />
+            </span>
+            <span className="min-w-0 flex-1 truncate">
+              <span className="font-medium">{name}</span> 正在发送 {label}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
 
 type ListRow =
   | { kind: 'day'; key: string; day: string }
@@ -175,7 +205,7 @@ function MessageList({
       <EmptyState
         icon={emptyIcon}
         title={`与「${convName}」的对话是空的`}
-        hint="把文件拖进来,或直接输入文字发送。对方在线即达,离线则寄存到中枢。"
+        hint="把文件拖进来,或直接输入文字发送。对方在线可直转,离线则先入库。"
       />
     )
   }
@@ -359,7 +389,7 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
               ? '所有设备可见可取的广播会话'
               : peer?.online
                 ? '对方在线,发送即时可达'
-                : '对方离线,文件将寄存到中枢'}
+                : '对方离线,文件将先写入文件库'}
           </span>
         </span>
       </header>
@@ -396,6 +426,8 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
           )}
         </div>
       )}
+
+      <IncomingTransferBanner conv={activeConv} />
 
       <MessageList
         conv={activeConv}

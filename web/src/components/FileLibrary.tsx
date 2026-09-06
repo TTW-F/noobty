@@ -1,4 +1,4 @@
-// 文件仓库:中枢寄存清单(GET /api/files),NAS 式浏览/取件/删除 + 虚拟列表
+// 文件库:中枢共享文件清单(GET /api/files),浏览 / 下载 / 删除 + 虚拟列表
 import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import {
   ArrowCounterClockwise,
@@ -20,6 +20,7 @@ import {
   formatClock,
   formatDayLabel,
   formatExpiresIn,
+  formatSpeed,
 } from '../lib/format'
 
 type Filter = 'all' | 'mine' | 'received' | 'image' | 'archive'
@@ -67,6 +68,7 @@ function buildFlatRows(filtered: LibraryEntry[], sort: Sort): FlatRow[] {
 function LibraryRow({ entry }: { entry: LibraryEntry }) {
   const download = useHub((s) => s.download)
   const state = useHub((s) => s.downloads[entry.file.file_id])
+  const downloaded = useHub((s) => Boolean(s.downloaded[entry.file.file_id]))
   const dead = useHub((s) => Boolean(s.deadFiles[entry.file.file_id]))
   const deleteStoredFile = useHub((s) => s.deleteStoredFile)
   const [confirming, setConfirming] = useState(false)
@@ -76,6 +78,7 @@ function LibraryRow({ entry }: { entry: LibraryEntry }) {
   const showThumb = isImage(entry.file.name) && !dead && !thumbFailed
   const expiringSoon =
     !dead && new Date(entry.expiresAt).getTime() - Date.now() < 86400_000 * 1.5
+  const done = downloaded || state?.status === 'saved'
 
   const status = () => {
     if (dead) return <span className="text-[12px] text-warning">已过期或已删除</span>
@@ -89,11 +92,14 @@ function LibraryRow({ entry }: { entry: LibraryEntry }) {
               style={{ transform: `scaleX(${Math.min(1, Math.max(0.02, ratio))})` }}
             />
           </span>
-          <span className="num text-[11.5px] text-primary-ink">{Math.round(ratio * 100)}%</span>
+          <span className="num text-[11.5px] text-primary-ink">
+            {Math.round(ratio * 100)}%
+            {state.speed > 0 ? ` · ${formatSpeed(state.speed)}` : ''}
+          </span>
         </span>
       )
     }
-    if (state?.status === 'saved') return <span className="text-[12px] text-primary-ink">已保存</span>
+    if (done) return <span className="text-[12px] text-primary-ink">已下载</span>
     if (state?.status === 'error') return <span className="text-[12px] text-danger">{state.message}</span>
     return (
       <span className={`text-[12px] ${expiringSoon ? 'text-warning' : 'text-muted'}`}>
@@ -134,21 +140,21 @@ function LibraryRow({ entry }: { entry: LibraryEntry }) {
         <span className="mt-0.5 block">{status()}</span>
       </span>
       <span className="flex shrink-0 items-center gap-1">
-        {!dead && state?.status !== 'saved' && (
+        {!dead && !done && state?.status !== 'downloading' && (
           <button
             onClick={() => download(entry.file)}
             className="flex h-9 items-center gap-1.5 rounded-[10px] bg-surface-2 px-3 text-[13px] font-medium text-ink transition-[background-color,transform] hover:bg-line active:scale-[0.98]"
           >
             <DownloadSimple size={14} />
-            {entry.mine ? '另存' : '取件'}
+            下载
           </button>
         )}
-        {!dead && state?.status === 'saved' && (
+        {!dead && done && (
           <button
             onClick={() => download(entry.file)}
             className="flex h-9 items-center gap-1.5 rounded-[10px] bg-surface-2 px-3 text-[13px] font-medium text-ink hover:bg-line"
           >
-            <ArrowCounterClockwise size={14} /> 再下
+            <ArrowCounterClockwise size={14} /> 重新下载
           </button>
         )}
         {dead && (
@@ -172,7 +178,7 @@ function LibraryRow({ entry }: { entry: LibraryEntry }) {
         open={confirming}
         onClose={() => setConfirming(false)}
         title="从中枢删除这个文件?"
-        body={`「${entry.file.name}」将从寄存区删除,引用它的聊天卡片也会移除;所有设备都无法再取件。`}
+        body={`「${entry.file.name}」将从文件库删除,引用它的聊天卡片也会移除;所有设备都无法再下载。`}
         confirmLabel="删除"
         onConfirm={() => deleteStoredFile(entry.file)}
       />
@@ -240,7 +246,7 @@ export function FileLibrary({ mobile = false, onBack }: { mobile?: boolean; onBa
               ? filter === 'all' && !query
                 ? `${library.length} 个文件 · ${formatBytes(library.reduce((s, e) => s + e.file.size, 0))}`
                 : `显示 ${filtered.length} / ${library.length} · ${formatBytes(totalSize)}`
-              : '中枢寄存的全部文件'}
+              : '中枢文件库全部文件'}
           </span>
         </span>
         <button
@@ -319,7 +325,7 @@ export function FileLibrary({ mobile = false, onBack }: { mobile?: boolean; onBa
           <EmptyState
             icon={<File size={26} />}
             title="仓库还是空的"
-            hint="发到中枢的文件会集中出现在这里,可随时取件或清理寄存空间。"
+            hint="发到中枢的文件会集中出现在这里,可随时下载或清理存储空间。"
           />
         ) : filtered.length === 0 ? (
           <EmptyState
@@ -349,7 +355,7 @@ export function FileLibrary({ mobile = false, onBack }: { mobile?: boolean; onBa
                     </button>
                   ) : null}
                   <p className="text-[11.5px] text-muted">
-                    清单来自中枢寄存区;到期或超配额时自动清理最旧文件。
+                    清单来自中枢文件库;到期或超配额时自动清理最旧文件。
                   </p>
                 </div>
               ),

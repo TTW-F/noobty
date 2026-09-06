@@ -1,5 +1,6 @@
 // Prefer File System Access streaming to disk; OPFS when no user gesture (auto relay);
-// Blob+<a download> only for small files. Multi-GiB archives must not accumulate in heap.
+// Blob+<a download> only for small files. Large files without stream sinks use native
+// browser download (system downloader — bytes never enter the page heap).
 
 import { getGrantedSaveDir } from './saveDir'
 
@@ -9,7 +10,7 @@ export interface SaveProgress {
   speed: number
 }
 
-/** Above this size, Blob fallback is refused (would OOM / thrash). */
+/** Above this size, in-memory Blob fallback is refused; use native download instead. */
 export const BLOB_FALLBACK_MAX_BYTES = 64 * 1024 * 1024
 
 type FilePickerWindow = Window &
@@ -32,20 +33,19 @@ export interface SaveSink {
   abort(): Promise<void>
 }
 
-function heapFriendlyError(name: string, size: number): Error {
-  const gib = (size / (1024 * 1024 * 1024)).toFixed(1)
-  return new Error(
-    `无法流式保存「${name}」（约 ${gib} GiB）：当前浏览器不支持直接写入磁盘。请使用 Chrome/Edge，或 Windows 托盘客户端。`,
-  )
-}
-
-function triggerAnchorDownload(url: string, filename: string): void {
+/** Hand off to the browser/OS download manager (no JS heap buffering). */
+export function nativeBrowserDownload(url: string, filename: string): void {
   const a = document.createElement('a')
   a.href = url
   a.download = filename
+  a.rel = 'noopener'
   document.body.append(a)
   a.click()
   a.remove()
+}
+
+function triggerAnchorDownload(url: string, filename: string): void {
+  nativeBrowserDownload(url, filename)
 }
 
 async function openPickerSink(suggestedName: string): Promise<SaveSink | null> {
@@ -248,9 +248,11 @@ async function openDirHandleSink(
 
 /**
  * Open a save sink.
- * Order: remembered default folder → save-picker → OPFS → Blob (≤64 MiB) → error.
+ * Order: remembered default folder → save-picker → OPFS → Blob (≤64 MiB).
+ * Returns `null` when the caller should use {@link nativeBrowserDownload} instead
+ * (large file and no stream sink available).
  */
-export async function openSaveSink(filename: string, totalBytes: number): Promise<SaveSink> {
+export async function openSaveSink(filename: string, totalBytes: number): Promise<SaveSink | null> {
   try {
     const remembered = await getGrantedSaveDir()
     if (remembered) return await openDirHandleSink(remembered, filename)
@@ -264,9 +266,7 @@ export async function openSaveSink(filename: string, totalBytes: number): Promis
   const opfs = await openOpfsSink(filename)
   if (opfs) return opfs
 
-  if (totalBytes > BLOB_FALLBACK_MAX_BYTES) {
-    throw heapFriendlyError(filename, totalBytes)
-  }
+  if (totalBytes > BLOB_FALLBACK_MAX_BYTES) return null
   return openBlobSink(filename)
 }
 

@@ -75,6 +75,13 @@ export type ServerFrame =
       size: number
       file_id: string
     }
+  | {
+      type: 'transfer_started'
+      transfer_id: string
+      from_device_id: string
+      conversation_id: string
+      files: { name: string; size: number }[]
+    }
   | { type: 'pong' }
 
 export type ClientFrame = { type: 'ping' } | { type: 'ack_message'; message_id: string }

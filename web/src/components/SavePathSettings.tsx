@@ -1,4 +1,4 @@
-// 取件保存路径:托盘壳可配任意盘符目录;浏览器记住默认文件夹(File System Access)。
+// 下载保存路径:托盘壳可配任意盘符目录;浏览器记住默认文件夹(File System Access)。
 import { useEffect, useState } from 'react'
 import { FolderOpen, ArrowCounterClockwise } from '@phosphor-icons/react'
 import {
@@ -95,7 +95,7 @@ export function SavePathSettings() {
         <div className="min-w-0 flex-1">
           <p className="text-[11px] text-muted">默认保存文件夹</p>
           <p className="mt-0.5 truncate text-[11.5px] text-ink" title={browserLabel ?? undefined}>
-            {browserLabel ? browserLabel : '未设置（每次取件时选择）'}
+            {browserLabel ? browserLabel : '未设置（每次下载时选择）'}
           </p>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             <button

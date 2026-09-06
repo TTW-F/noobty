@@ -152,7 +152,21 @@ pub enum Event {
         size: u64,
         file_id: String,
     },
+    /// Sender just started uploading (WeChat-style): show an incoming card
+    /// before the durable message exists. Ephemeral — not in history.
+    TransferStarted {
+        transfer_id: String,
+        from_device_id: String,
+        conversation_id: String,
+        files: Vec<TransferFileHint>,
+    },
     Pong,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferFileHint {
+    pub name: String,
+    pub size: u64,
 }
 
 /// Frames the hub accepts from connected devices. Protocol-level WebSocket
@@ -180,6 +194,12 @@ pub struct TextReq {
 pub struct FileGroupReq {
     /// Already-uploaded file ids (complete without posting a message first).
     pub file_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransferAnnounceReq {
+    pub transfer_id: String,
+    pub files: Vec<TransferFileHint>,
 }
 
 #[derive(Debug, Deserialize)]

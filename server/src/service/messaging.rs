@@ -168,6 +168,41 @@ pub async fn conversation_summaries(
         .collect())
 }
 
+/// Ephemeral "I'm sending these files" notice (not persisted). Peers show an
+/// incoming transfer card until the real message arrives — WeChat-style.
+pub async fn announce_transfer(
+    st: &SharedState,
+    from_device_id: &str,
+    conversation_id: &str,
+    transfer_id: String,
+    files: Vec<crate::wire::TransferFileHint>,
+) -> Result<()> {
+    if transfer_id.is_empty() || transfer_id.len() > 80 {
+        return Err(Error::Validation("transfer_id invalid".into()));
+    }
+    if files.is_empty() || files.len() > 100 {
+        return Err(Error::Validation("announce 1..=100 files".into()));
+    }
+    for f in &files {
+        if f.name.is_empty() || f.name.len() > 255 {
+            return Err(Error::Validation("file name invalid".into()));
+        }
+    }
+    let peer = conversation_peer(st, conversation_id).await?;
+    let event = Event::TransferStarted {
+        transfer_id,
+        from_device_id: from_device_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+        files,
+    };
+    if peer == "lobby" {
+        st.registry.broadcast(&event, Some(from_device_id));
+    } else {
+        st.registry.push(&peer, event);
+    }
+    Ok(())
+}
+
 /// Devices are equal: any registered device may delete any message.
 /// Deleting a file message cascades to the stored bytes via `purge_file`.
 pub async fn delete_message(st: &SharedState, message_id: &str) -> Result<()> {

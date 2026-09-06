@@ -38,6 +38,25 @@ pub async fn post_file_group(
     Ok((StatusCode::CREATED, Json((&message).into())))
 }
 
+/// POST /api/conversations/{id}/transfers/announce — ephemeral send notice.
+pub async fn announce_transfer(
+    State(st): State<SharedState>,
+    Path(conversation_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<wire::TransferAnnounceReq>,
+) -> Result<StatusCode> {
+    let device = acting_device(&st, &headers).await?;
+    service::messaging::announce_transfer(
+        &st,
+        &device.id,
+        &conversation_id,
+        req.transfer_id,
+        req.files,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_conversations(
     State(st): State<SharedState>,
 ) -> Result<Json<Vec<wire::ConversationSummary>>> {

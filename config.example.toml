@@ -18,7 +18,8 @@ retention_days = 5
 max_total_bytes = 32212254720
 
 # Advisory chunk size for resumable uploads; also the request body limit.
-chunk_size = 4194304
+# 16 MiB on LAN cuts HTTP round-trips vs 4 MiB.
+chunk_size = 16777216
 
 # Upload sessions untouched for longer than this are swept (row + staging
 # blob), returning their reserved quota. In hours.

@@ -52,10 +52,12 @@ export function Lightbox() {
 export function FileCard({ file, mine, compact = false }: { file: FileRef; mine: boolean; compact?: boolean }) {
   const download = useHub((s) => s.download)
   const state = useHub((s) => s.downloads[file.file_id])
+  const downloaded = useHub((s) => Boolean(s.downloaded[file.file_id]))
   const dead = useHub((s) => Boolean(s.deadFiles[file.file_id]))
   const retention = useHub((s) => s.storage?.retention_days)
   const kind = fileKind(file.name)
   const Icon = KIND_ICON[kind]
+  const done = downloaded || state?.status === 'saved'
 
   const onGet = () => download(file)
 
@@ -66,20 +68,20 @@ export function FileCard({ file, mine, compact = false }: { file: FileRef; mine:
           <Warning size={13} weight="fill" /> 已过期或已删除
         </span>
       )
-    if (!mine && state?.status === 'downloading') {
+    if (state?.status === 'downloading') {
       return (
         <span className="num text-[12px] text-primary-ink">
           {formatBytes(state.receivedBytes)} / {formatBytes(state.totalBytes)} · {formatSpeed(state.speed)}
         </span>
       )
     }
-    if (!mine && state?.status === 'saved')
+    if (done)
       return (
         <span className="flex items-center gap-1 text-[12px] text-primary-ink">
-          <CheckCircle size={13} weight="fill" /> 已保存
+          <CheckCircle size={13} weight="fill" /> 已下载
         </span>
       )
-    if (!mine && state?.status === 'error')
+    if (state?.status === 'error')
       return (
         <span className="flex items-center gap-1 text-[12px] text-danger">
           <Warning size={13} weight="fill" /> {state.message.includes('404') ? '已过期或已删除' : '下载失败'}
@@ -89,14 +91,14 @@ export function FileCard({ file, mine, compact = false }: { file: FileRef; mine:
   }
 
   const action = () => {
-    if (mine || dead) return null
+    if (dead) return null
     if (state?.status === 'downloading')
       return (
         <span className="num text-[12px] font-medium text-primary-ink">
           {Math.round((state.receivedBytes / Math.max(1, state.totalBytes)) * 100)}%
         </span>
       )
-    if (state?.status === 'saved')
+    if (done)
       return (
         <Button variant="ghost" className="h-8 px-2.5 text-[12.5px]" onClick={onGet}>
           <ArrowsClockwise size={14} /> 重新下载
@@ -110,7 +112,7 @@ export function FileCard({ file, mine, compact = false }: { file: FileRef; mine:
       )
     return (
       <Button variant="secondary" className="h-8 gap-1 px-3 text-[12.5px]" onClick={onGet}>
-        <DownloadSimple size={14} weight="bold" /> 取件
+        <DownloadSimple size={14} weight="bold" /> 下载
       </Button>
     )
   }
@@ -146,21 +148,19 @@ export function FileCard({ file, mine, compact = false }: { file: FileRef; mine:
           </span>
         </span>
       </div>
-      {!mine && state?.status === 'downloading' && (
+      {state?.status === 'downloading' && (
         <div className="px-3.5">
           <Progress value={state.totalBytes > 0 ? state.receivedBytes / state.totalBytes : 0} />
         </div>
       )}
       <div className="flex items-center justify-between gap-2 px-3.5 pb-3.5 pt-2.5">
-        {/* 空闲态的尺寸已在头部展示,底部只放动态状态或一句提示 */}
         {(() => {
-          const dynamic = !dead && state && state.status !== undefined
-          if (dynamic || dead) return statusLine()
+          if (dead || state || done) return statusLine()
           return (
             <span className="text-[12px] text-muted">
               {mine
-                ? `已寄存${retention ? `,对方 ${retention} 天内可取` : ''}`
-                : `点击取件${retention ? `,文件保留 ${retention} 天` : ''}`}
+                ? `已发送${retention ? ` · 库内保留 ${retention} 天` : ''}`
+                : `点击下载${retention ? ` · 保留 ${retention} 天` : ''}`}
             </span>
           )
         })()}
@@ -369,7 +369,7 @@ export const MessageRow = memo(function MessageRow({ message, mine, grouped, sen
         open={confirming}
         onClose={() => setConfirming(false)}
         title="删除这条消息?"
-        body={message.kind === 'text' ? undefined : '对应的寄存文件也会一并删除,其他设备将无法再取件。'}
+        body={message.kind === 'text' ? undefined : '对应文件也会从文件库删除,其他设备将无法再下载。'}
         onConfirm={() => deleteMessage(message)}
       />
     </div>
