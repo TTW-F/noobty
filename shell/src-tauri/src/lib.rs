@@ -168,7 +168,7 @@ async fn download_to(
     state: tauri::State<'_, ShellState>,
     url: String,
     name: String,
-    on_progress: Option<tauri::ipc::Channel<download::DownloadProgress>>,
+    on_progress: tauri::ipc::Channel<download::DownloadProgress>,
 ) -> Result<String, String> {
     let hub = state.hub.lock().unwrap().clone();
     let dir_cfg = state.download_dir.lock().unwrap().clone();
@@ -178,7 +178,7 @@ async fn download_to(
         "[shell] invoke download_to name={name} url={absolute} dir={}",
         dir.display()
     );
-    let result = download::download_to_dir(&absolute, &name, &dir, on_progress).await;
+    let result = download::download_to_dir(&absolute, &name, &dir, Some(on_progress)).await;
     match &result {
         Ok(path) => eprintln!("[shell] download_to ok -> {path}"),
         Err(e) => eprintln!("[shell] download_to ERR {e}"),

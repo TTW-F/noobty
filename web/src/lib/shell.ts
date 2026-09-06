@@ -116,9 +116,11 @@ export async function shellDownloadToDownloads(
     url: `${origin}/api/files/${encodeURIComponent(file.file_id)}`,
     name: file.name,
   }
-  if (typeof Channel === 'function') {
-    args.onProgress = makeProgressChannel(Channel, onProgress)
+  if (typeof Channel !== 'function') {
+    console.error('[shell] Channel API unavailable')
+    return null
   }
+  args.onProgress = makeProgressChannel(Channel, onProgress)
   try {
     const path = await invoke('download_to', args)
     return typeof path === 'string' ? path : null
