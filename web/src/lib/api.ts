@@ -104,10 +104,25 @@ export interface CompleteResp {
   message?: Message
 }
 
+/** Tauri updater / web download payload from GET /releases/shell/latest.json */
+export interface ShellRelease {
+  version: string
+  notes?: string
+  pub_date?: string
+  url: string
+  signature: string
+}
+
 export const api = {
   healthz: () => request<HubVersion>('/api/healthz'),
 
   storage: () => request<StorageInfo>('/api/storage'),
+
+  /** `null` when hub has no staged shell installer (204). */
+  shellLatest: async (): Promise<ShellRelease | null> => {
+    const r = await request<ShellRelease | undefined>('/releases/shell/latest.json')
+    return r ?? null
+  },
 
   registerDevice: (name: string) =>
     request<StoredIdentity>('/api/devices/register', {

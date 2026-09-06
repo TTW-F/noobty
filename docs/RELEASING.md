@@ -47,6 +47,7 @@ pwsh scripts/publish-shell-release.ps1 -Notes "…"
 
 3. Clients already running a signed shell: tray →「检查更新…」  
    Endpoint: `http://<hub>:7317/releases/shell/latest.json`  
-   Installer binary: `http://<hub>:7317/releases/shell/Noobty_….exe`
+   Installer binary: `http://<hub>:7317/releases/shell/Noobty_….exe`  
+   Browsers on the hub UI also show a download link (sidebar + register screen) when a release is staged.
 
 Uninstall (Windows「应用和功能」) removes `%APPDATA%\noobty-shell` and the autostart entry. The receive folder (e.g. `Downloads\Noobty`) is **kept**.

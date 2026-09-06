@@ -17,6 +17,7 @@ import { useHub } from '../store/hub'
 import { Dialog, IconButton, PresenceDot } from './ui'
 import { StorageMeter } from './StorageMeter'
 import { SavePathSettings } from './SavePathSettings'
+import { ShellDownload } from './ShellDownload'
 import { deviceIcon } from '../lib/files'
 import { formatRelative } from '../lib/format'
 import { hubInviteQrSvg } from '../lib/qr'
@@ -261,6 +262,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
       {/* 存储面板 */}
       <StorageMeter />
       <SavePathSettings />
+      <ShellDownload />
 
       {/* 底部:中枢信息 */}
       <div className="flex items-center gap-1 border-t border-line px-3 py-2.5">

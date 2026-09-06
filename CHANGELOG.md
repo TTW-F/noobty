@@ -11,6 +11,7 @@ Version numbers are kept in lockstep across `server`, `web`, `shell`, and `tauri
 - Hub serves shell release artifacts under `{storage}/releases/shell/`.
 - NSIS uninstall hook: removes `%APPDATA%\noobty-shell` and autostart registry entry (receive folder kept).
 - `scripts/publish-shell-release.ps1` to stage installer + meta onto the hub releases dir.
+- Web UI: browser sidebar + register screen offer Windows tray installer download from `/releases/shell/latest.json`.
 - Versioning / release notes convention (this file + git tags `vX.Y.Z`).
 
 ### Changed

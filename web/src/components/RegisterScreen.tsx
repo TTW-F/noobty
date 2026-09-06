@@ -1,6 +1,8 @@
 // 首次使用的引导屏:给这台设备起个名字
-import { useState, type FormEvent } from 'react'
-import { CircleNotch } from '@phosphor-icons/react'
+import { useEffect, useState, type FormEvent } from 'react'
+import { CircleNotch, DownloadSimple } from '@phosphor-icons/react'
+import { api, type ShellRelease } from '../lib/api'
+import { inShell } from '../lib/shell'
 import { useHub } from '../store/hub'
 
 export function RegisterScreen() {
@@ -8,6 +10,12 @@ export function RegisterScreen() {
   const [name, setName] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [shell, setShell] = useState<ShellRelease | null>(null)
+
+  useEffect(() => {
+    if (inShell) return
+    void api.shellLatest().then(setShell).catch(() => setShell(null))
+  }, [])
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
@@ -75,6 +83,20 @@ export function RegisterScreen() {
             进入
           </button>
         </form>
+
+        {shell && (
+          <a
+            href={shell.url}
+            download
+            className="mt-5 flex items-center justify-center gap-2 rounded-[10px] border border-line bg-surface px-3 py-2.5 text-[12.5px] text-ink transition-colors hover:bg-surface-2"
+          >
+            <DownloadSimple size={15} className="text-primary" aria-hidden />
+            <span>
+              下载 Windows 托盘客户端
+              <span className="num ml-1.5 text-muted">v{shell.version}</span>
+            </span>
+          </a>
+        )}
 
         <p className="num mt-6 text-center text-[11.5px] text-muted/80">中枢 {location.host}</p>
       </div>
