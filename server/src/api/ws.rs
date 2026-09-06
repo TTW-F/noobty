@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
@@ -50,6 +50,11 @@ async fn handle_socket(socket: WebSocket, st: SharedState, dws: crate::domain::D
                         continue;
                     }
                 },
+                // 4001 = private-use "superseded": another session for this device won.
+                Outbound::Superseded => WsMessage::Close(Some(CloseFrame {
+                    code: 4001u16.into(),
+                    reason: "superseded".into(),
+                })),
                 Outbound::Close => WsMessage::Close(None),
             };
             let closing = matches!(frame, WsMessage::Close(_));

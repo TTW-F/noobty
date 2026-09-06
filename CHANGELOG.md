@@ -16,6 +16,7 @@ Version numbers are kept in lockstep across `server`, `web`, `shell`, and `tauri
 
 ### Changed
 - Product version bumped to 0.2.0 across packages.
+- WebSocket: duplicate sessions for one device close with code `4001` (superseded); clients pause aggressive reconnect to stop kick storms when browser + tray (or multiple tabs) share a device identity.
 
 ## [0.1.0] — 2026-09-06
 

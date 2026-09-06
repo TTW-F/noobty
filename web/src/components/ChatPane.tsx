@@ -368,13 +368,17 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
         <div
           aria-live="assertive"
           className={`anim-drop flex shrink-0 items-center gap-2 px-4 py-2 text-[12.5px] ${
-            status === 'offline' ? 'bg-danger-soft text-ink' : 'bg-surface text-muted'
+            status === 'offline' || status === 'taken' ? 'bg-danger-soft text-ink' : 'bg-surface text-muted'
           }`}
         >
-          {status === 'offline' ? (
+          {status === 'offline' || status === 'taken' ? (
             <>
               <Plugs size={15} className="text-danger" />
-              <span className="flex-1">与中枢断开了连接</span>
+              <span className="flex-1">
+                {status === 'taken'
+                  ? '此设备身份正在其他窗口使用（请关掉多余的浏览器标签，或托盘与浏览器不要用同一设备名）'
+                  : '与中枢断开了连接'}
+              </span>
               <button
                 onClick={retryConnection}
                 className="h-7 rounded-full bg-danger px-3 text-[12px] font-medium text-white transition-opacity hover:opacity-90"

@@ -19,9 +19,10 @@ pub const CHANNEL_CAPACITY: usize = 128;
 #[derive(Debug)]
 pub enum Outbound {
     Event(Box<Event>),
-    /// Session is superseded or the consumer is too slow: close the socket;
-    /// the client reconnects and catches up.
+    /// Consumer too slow or hub shutting down: close; client should reconnect.
     Close,
+    /// A newer session for this device took over — client must not fight it.
+    Superseded,
 }
 
 struct Conn {
@@ -52,7 +53,7 @@ impl Registry {
         let mut conns = self.conns.write().expect("registry lock poisoned");
         if let Some(old) = conns.insert(device_id.to_string(), Conn { generation, tx }) {
             tracing::info!("device {device_id} reconnected; kicking superseded session");
-            let _ = old.tx.try_send(Outbound::Close);
+            let _ = old.tx.try_send(Outbound::Superseded);
         }
         generation
     }

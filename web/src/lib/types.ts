@@ -102,4 +102,4 @@ export interface TransferTask {
   file?: File
 }
 
-export type ConnectionState = 'connecting' | 'online' | 'reconnecting' | 'offline'
+export type ConnectionState = 'connecting' | 'online' | 'reconnecting' | 'offline' | 'taken'

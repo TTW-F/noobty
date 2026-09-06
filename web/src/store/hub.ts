@@ -12,7 +12,7 @@ import { sendFile, sendFileBatch, receiveRelay, type UploadHandle } from '../lib
 import { inShell, shellDownloadToDownloads } from '../lib/shell'
 import { sweepAbandonedOpfsSaves } from '../lib/saveStream'
 import { closeLightbox } from '../lib/lightbox'
-import { HubSocket } from '../lib/ws'
+import { HubSocket, bindWsTabLeader } from '../lib/ws'
 import type {
   ConnectionState,
   ConversationId,
@@ -160,6 +160,7 @@ interface HubState {
 }
 
 let socket: HubSocket | null = null
+let releaseTabLock: (() => void) | null = null
 const uploadHandles = new Map<string, UploadHandle>()
 const downloadHandles = new Map<string, DownloadHandle>()
 const historyInflight = new Map<string, Promise<void>>()
@@ -176,6 +177,13 @@ const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${(seq++
 
 function isAbort(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError'
+}
+
+function disconnectSocket(): void {
+  releaseTabLock?.()
+  releaseTabLock = null
+  socket?.close()
+  socket = null
 }
 
 export const useHub = create<HubState>((set, get) => {
@@ -904,27 +912,36 @@ export const useHub = create<HubState>((set, get) => {
   }
 
   function connectSocket(deviceId: string): void {
-    socket?.close()
-    socket = new HubSocket({
-      onFrame: handleFrame,
-      onStatus: (status) => {
-        set({ status })
-        if (status === 'online') {
-          if (everConnected) {
-            // 重连:快照刷新侧栏;消息补拉只针对当前持有窗口的会话(其余切回时再 loadHistory)
-            void syncSnapshot()
-            const conv = get().activeConv
-            if (conv && get().historyStatus[conv] === 'ready') catchUpImpl(conv)
-          } else {
-            everConnected = true
-            void syncSnapshot()
-            const conv = get().activeConv
-            if (conv) void loadHistory(conv)
-          }
-        }
+    disconnectSocket()
+    releaseTabLock = bindWsTabLeader(
+      () => {
+        socket?.close()
+        socket = new HubSocket({
+          onFrame: handleFrame,
+          onStatus: (status) => {
+            set({ status })
+            if (status === 'online') {
+              if (everConnected) {
+                void syncSnapshot()
+                const conv = get().activeConv
+                if (conv && get().historyStatus[conv] === 'ready') catchUpImpl(conv)
+              } else {
+                everConnected = true
+                void syncSnapshot()
+                const conv = get().activeConv
+                if (conv) void loadHistory(conv)
+              }
+            }
+          },
+        })
+        socket.connect(deviceId)
       },
-    })
-    socket.connect(deviceId)
+      () => {
+        socket?.close()
+        socket = null
+        set({ status: 'taken' })
+      },
+    )
   }
 
   function runUpload(task: TransferTask, file: File): void {
@@ -1096,8 +1113,7 @@ export const useHub = create<HubState>((set, get) => {
 
     forgetDevice: () => {
       clearIdentity()
-      socket?.close()
-      socket = null
+      disconnectSocket()
       for (const t of downloadClearTimers.values()) clearTimeout(t)
       downloadClearTimers.clear()
       if (parkTimer) {
@@ -1133,7 +1149,8 @@ export const useHub = create<HubState>((set, get) => {
     retryConnection: () => {
       const me = get().me
       if (!me) return
-      socket?.reconnectNow(me.device_id)
+      // 重新抢标签锁并立即重连(被抢占时也能夺回)
+      connectSocket(me.device_id)
     },
 
     setActiveConv: (conv) => {

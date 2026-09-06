@@ -3,12 +3,18 @@
 // 退避公式学自 Centrifugo JS SDK / AWS "Exponential Backoff and Jitter":
 //   delay = randomInt(0, min(max, base · 2^(attempt-1)))
 // Full Jitter 避免多设备同时断线后齐步重连打满中枢(惊群)。
+//
+// 关闭码 4001 = 被同 device_id 的更新会话抢占:停止互踢风暴,改长间隔再试。
 import type { ClientFrame, ConnectionState, ServerFrame } from './types'
 
 /** 应用层 ping 间隔;须明显小于服务端 IDLE_TIMEOUT(90s) */
 export const HEARTBEAT_MS = 25_000
 export const RECONNECT_BASE_MS = 1_000
 export const RECONNECT_MAX_MS = 15_000
+/** 被其他窗口抢占后,自动再试的下限(避免与对端互踢) */
+export const SUPERSEDED_RETRY_MS = 25_000
+/** WebSocket private-use: hub kicked this session because another took the device */
+export const WS_CLOSE_SUPERSEDED = 4001
 
 /**
  * Full Jitter 退避延迟(纯函数,便于单测与文档引用)。
@@ -36,11 +42,15 @@ export class HubSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private attempts = 0
   private closedByUser = false
+  /** 最近一次关闭是否为被抢占(横幅文案用) */
+  private lastSuperseded = false
 
   constructor(private readonly handlers: HubSocketHandlers) {}
 
   connect(deviceId: string): void {
     this.closedByUser = false
+    this.attempts = 0
+    this.lastSuperseded = false
     this.open(deviceId)
   }
 
@@ -52,11 +62,12 @@ export class HubSocket {
 
   /** 断线横幅上的"重试":立即重连,不等退避计时 */
   reconnectNow(deviceId: string): void {
+    this.closedByUser = false
+    this.lastSuperseded = false
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
-    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) return
     this.open(deviceId)
   }
 
@@ -67,14 +78,32 @@ export class HubSocket {
   }
 
   private open(deviceId: string): void {
-    this.handlers.onStatus(this.attempts === 0 ? 'connecting' : 'reconnecting')
+    // 丢弃进行中的旧套接字,避免同实例双连接互踢
+    if (this.ws) {
+      this.ws.onclose = null
+      this.ws.onerror = null
+      try {
+        this.ws.close()
+      } catch {
+        /* ignore */
+      }
+      this.ws = null
+    }
+    this.stopHeartbeat()
+
+    this.handlers.onStatus(
+      this.lastSuperseded ? 'taken' : this.attempts === 0 ? 'connecting' : 'reconnecting',
+    )
 
     const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/api/ws?device_id=${encodeURIComponent(deviceId)}`)
+    const ws = new WebSocket(
+      `${proto}://${location.host}/api/ws?device_id=${encodeURIComponent(deviceId)}`,
+    )
     this.ws = ws
 
     ws.onopen = () => {
       this.attempts = 0
+      this.lastSuperseded = false
       this.handlers.onStatus('online')
       this.startHeartbeat()
     }
@@ -87,22 +116,37 @@ export class HubSocket {
       }
     }
 
-    ws.onclose = () => {
+    ws.onclose = (event) => {
       this.stopHeartbeat()
+      if (this.ws === ws) this.ws = null
       if (this.closedByUser) return
+      if (event.code === WS_CLOSE_SUPERSEDED) {
+        this.lastSuperseded = true
+        this.handlers.onStatus('taken')
+        // 长间隔再试:对端已关则恢复;对端仍在则再被踢,但不会亚秒级狂闪
+        const delay = SUPERSEDED_RETRY_MS + Math.floor(Math.random() * 10_000)
+        this.scheduleReconnect(deviceId, delay)
+        return
+      }
+      this.lastSuperseded = false
       this.scheduleReconnect(deviceId)
     }
 
     ws.onerror = () => {
-      // onclose 会跟着触发,由 onclose 统一安排重连
-      ws.close()
+      try {
+        ws.close()
+      } catch {
+        /* ignore */
+      }
     }
   }
 
-  private scheduleReconnect(deviceId: string): void {
+  private scheduleReconnect(deviceId: string, delayOverride?: number): void {
     this.attempts++
-    this.handlers.onStatus(this.attempts > 1 ? 'reconnecting' : 'offline')
-    const delay = reconnectDelayMs(this.attempts)
+    if (delayOverride == null) {
+      this.handlers.onStatus(this.attempts > 1 ? 'reconnecting' : 'offline')
+    }
+    const delay = delayOverride ?? reconnectDelayMs(this.attempts)
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = setTimeout(() => this.open(deviceId), delay)
   }
@@ -132,5 +176,54 @@ export class HubSocket {
       this.ws.close()
       this.ws = null
     }
+  }
+}
+
+const TAB_LOCK_KEY = 'noobty.ws.leader.v1'
+
+/**
+ * 同起源多标签选主(localStorage)。持锁标签跑 `onLead`,丢锁时 `onYield`。
+ * 托盘与系统浏览器存储隔离,跨进程互踢仍靠 4001。
+ */
+export function bindWsTabLeader(onLead: () => void, onYield: () => void): () => void {
+  const tabId =
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+  let leading = false
+
+  const claim = () => {
+    try {
+      localStorage.setItem(TAB_LOCK_KEY, tabId)
+    } catch {
+      /* private mode */
+    }
+    if (!leading) {
+      leading = true
+      onLead()
+    }
+  }
+
+  const onStorage = (ev: StorageEvent) => {
+    if (ev.key !== TAB_LOCK_KEY || ev.newValue == null) return
+    if (ev.newValue === tabId) return
+    if (leading) {
+      leading = false
+      onYield()
+    }
+  }
+
+  window.addEventListener('storage', onStorage)
+  claim()
+
+  return () => {
+    window.removeEventListener('storage', onStorage)
+    try {
+      if (localStorage.getItem(TAB_LOCK_KEY) === tabId) localStorage.removeItem(TAB_LOCK_KEY)
+    } catch {
+      /* ignore */
+    }
+    leading = false
   }
 }
