@@ -4,7 +4,15 @@
 // - complete 返回 { file_id, message }(message 为服务端生成的消息本体)
 // - 会话摘要为 { conversation_id, peer, last_message?: brief },无 unread 字段
 // - 大厅(lobby)为广播会话;旧中枢可能拒绝,客户端以探测结果门控
-import type { ConversationId, Device, HubVersion, Message, StorageInfo, UploadSession } from './types'
+import type {
+  ConversationId,
+  Device,
+  HubVersion,
+  Message,
+  StorageInfo,
+  StoredFileItem,
+  UploadSession,
+} from './types'
 
 export const DEVICE_STORAGE_KEY = 'noobty.device.v1'
 
@@ -224,7 +232,17 @@ export const api = {
       `/api/files/${encodeURIComponent(fileId)}/meta`,
     ),
 
+  /** 文件仓库:中枢当前寄存的文件(最新在前)。`before` = 游标(更旧一页)。 */
+  listFiles: (limit = 100, before?: string) => {
+    const q = new URLSearchParams({ limit: String(limit) })
+    if (before) q.set('before', before)
+    return request<{ files: StoredFileItem[] }>(`/api/files?${q}`)
+  },
+
   fileUrl: (fileId: string) => `/api/files/${encodeURIComponent(fileId)}`,
+
+  /** 小图预览(JPEG);非图片或过大时 404 */
+  thumbUrl: (fileId: string) => `/api/files/${encodeURIComponent(fileId)}/thumb`,
 }
 
 export interface RelayCreated {

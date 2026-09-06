@@ -22,6 +22,17 @@ pub async fn file_entry(st: &SharedState, file_id: &str) -> Result<FileEntry> {
         .ok_or_else(|| Error::NotFound(format!("file {file_id} not found")))
 }
 
+/// Warehouse listing: newest first. `limit` is clamped to 1..=1000 (default 500).
+/// `before` is an optional file_id cursor for older pages.
+pub async fn list_files(
+    st: &SharedState,
+    limit: Option<u32>,
+    before: Option<String>,
+) -> Result<Vec<FileEntry>> {
+    let limit = limit.unwrap_or(500).clamp(1, 1000) as i64;
+    repo::files::list(&st.db, limit, before).await
+}
+
 /// Start (or resume) an upload session. Quota is checked against committed
 /// files plus in-flight upload bytes; a matching incomplete session from the
 /// same device resumes instead of starting over.

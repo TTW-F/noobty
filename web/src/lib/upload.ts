@@ -1,5 +1,8 @@
 // 分块上传 + 断点续传(docs/API.md Upload 一节)
 // ≤ SHA256_MAX_BYTES 的文件计算 sha256 参与续传/秒传匹配;更大文件由服务端按 名字+大小 匹配。
+// 增量哈希:避免 file.arrayBuffer() 整文件入堆(10+ GiB 归档根本不会哈希;≤128 MiB 也不再 O(n) RAM)。
+import { sha256 } from '@noble/hashes/sha2.js'
+import { bytesToHex } from '@noble/hashes/utils.js'
 import { api, type CompleteResp } from './api'
 
 const SHA256_MAX_BYTES = 128 * 1024 * 1024
@@ -11,12 +14,16 @@ export interface UploadProgress {
 }
 
 async function sha256Hex(file: File): Promise<string | undefined> {
-  if (file.size > SHA256_MAX_BYTES || !file.stream) return undefined
+  if (file.size > SHA256_MAX_BYTES || typeof file.stream !== 'function') return undefined
   try {
-    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer())
-    return Array.from(new Uint8Array(digest))
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('')
+    const hasher = sha256.create()
+    const reader = file.stream().getReader()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value && value.byteLength > 0) hasher.update(value)
+    }
+    return bytesToHex(hasher.digest())
   } catch {
     return undefined
   }
@@ -45,10 +52,13 @@ export function uploadFile(
     const chunkSize = session.chunk_size > 0 ? session.chunk_size : 4 * 1024 * 1024
     let offset = Math.min(session.received_bytes, file.size)
 
-    // 近 3 秒速度窗口:[时间戳 ms, 累计字节]
+    // 近 3 秒速度窗口:[时间戳 ms, 累计字节];进度回调约 150ms 节流,避免大文件打爆 React。
     const window: Array<[number, number]> = []
-    const report = () => {
+    let lastReport = 0
+    const report = (force = false) => {
       const now = Date.now()
+      if (!force && now - lastReport < 150 && offset < file.size) return
+      lastReport = now
       window.push([now, offset])
       while (window.length > 1 && now - window[0]![0] > 3_000) window.shift()
       const first = window[0]!
@@ -56,7 +66,7 @@ export function uploadFile(
       onProgress({ sentBytes: offset, speed })
     }
 
-    report()
+    report(true)
     while (offset < file.size) {
       if (controller.signal.aborted) throw new DOMException('已取消', 'AbortError')
       const end = Math.min(offset + chunkSize, file.size)
@@ -76,10 +86,10 @@ export function uploadFile(
           await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** (retries - 1), 8000)))
           const state = await api.queryUpload(uploadId, deviceId)
           offset = Math.min(state.received_bytes, file.size)
-          report()
+          report(true)
         }
       }
-      report()
+      report(false)
     }
 
     const resp = await api.completeUpload(uploadId, deviceId, conversationId)

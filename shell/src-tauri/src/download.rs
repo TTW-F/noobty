@@ -1,8 +1,8 @@
-//! 自动接收:把中枢寄存的文件流式下载到 系统下载目录/Noobty
+//! 自动接收:把中枢寄存的文件流式下载到可配置的接收目录
 
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::ipc::Channel;
 use tokio::io::AsyncWriteExt;
 
@@ -27,7 +27,7 @@ fn sanitize_name(raw: &str) -> String {
 }
 
 /// 目标已存在时追加序号:name.ext → name (1).ext
-fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
     if !path.exists() {
         return path;
@@ -51,19 +51,17 @@ fn unique_path(dir: &PathBuf, name: &str) -> PathBuf {
     dir.join(format!("{stem}-overflow.bin"))
 }
 
-pub async fn download_to_downloads(
+pub async fn download_to_dir(
     url: &str,
     name: &str,
+    dir: &Path,
     on_progress: Channel<DownloadProgress>,
 ) -> Result<String, String> {
-    let dir = dirs::download_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Noobty");
-    tokio::fs::create_dir_all(&dir)
+    tokio::fs::create_dir_all(dir)
         .await
-        .map_err(|e| format!("创建下载目录失败:{e}"))?;
+        .map_err(|e| format!("创建接收目录失败:{e}"))?;
 
-    let dest = unique_path(&dir, &sanitize_name(name));
+    let dest = unique_path(dir, &sanitize_name(name));
 
     let resp = reqwest::get(url)
         .await
@@ -72,9 +70,10 @@ pub async fn download_to_downloads(
         .map_err(|e| format!("下载请求失败:{e}"))?;
 
     let total = resp.content_length().unwrap_or(0);
-    let mut file = tokio::fs::File::create(&dest)
+    let file = tokio::fs::File::create(&dest)
         .await
         .map_err(|e| format!("创建文件失败:{e}"))?;
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
     let mut stream = resp.bytes_stream();
     let mut received: u64 = 0;
     let mut last_sent = std::time::Instant::now();
@@ -85,7 +84,6 @@ pub async fn download_to_downloads(
             .await
             .map_err(|e| format!("写入失败:{e}"))?;
         received += chunk.len() as u64;
-        // 进度节流:每 150ms 或收尾时上报一次
         if last_sent.elapsed().as_millis() > 150 {
             let _ = on_progress.send(DownloadProgress { received, total });
             last_sent = std::time::Instant::now();

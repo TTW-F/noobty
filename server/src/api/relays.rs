@@ -49,7 +49,7 @@ pub async fn receive(
 ) -> Result<Response> {
     let device = acting_device(&st, &headers).await?;
     let (meta, stream) = service::relays::take_receiver(&st, &relay_id, &device.id).await?;
-    let body = Body::from_stream(ReaderStream::with_capacity(stream, 64 * 1024));
+    let body = Body::from_stream(ReaderStream::with_capacity(stream, 256 * 1024));
     let disposition = crate::api::files::content_disposition(&meta.name);
     Response::builder()
         .status(StatusCode::OK)

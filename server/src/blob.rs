@@ -21,6 +21,7 @@ impl BlobStore {
     pub fn new(root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(root.join("files"))?;
         std::fs::create_dir_all(root.join("tmp"))?;
+        std::fs::create_dir_all(root.join("thumbs"))?;
         Ok(Self {
             root,
             inflight_uploads: Mutex::new(HashSet::new()),
@@ -33,6 +34,11 @@ impl BlobStore {
 
     pub fn file_path(&self, file_id: &str) -> PathBuf {
         self.root.join("files").join(file_id)
+    }
+
+    /// Cached JPEG thumbnail for image previews (warehouse / chat).
+    pub fn thumb_path(&self, file_id: &str) -> PathBuf {
+        self.root.join("thumbs").join(format!("{file_id}.jpg"))
     }
 
     pub fn try_lock_upload(&self, upload_id: &str) -> bool {
@@ -106,6 +112,7 @@ impl BlobStore {
     }
 
     pub async fn remove(&self, file_id: &str) -> Result<bool> {
+        let _ = tokio::fs::remove_file(self.thumb_path(file_id)).await;
         match tokio::fs::remove_file(self.file_path(file_id)).await {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),

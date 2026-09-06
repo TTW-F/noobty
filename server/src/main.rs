@@ -95,11 +95,13 @@ async fn main() {
             "/api/messages/{message_id}",
             delete(api::conversations::delete_message),
         )
+        .route("/api/files", get(api::files::list))
         .route(
             "/api/files/{file_id}",
             get(api::files::download).delete(api::files::delete_file),
         )
         .route("/api/files/{file_id}/meta", get(api::files::meta))
+        .route("/api/files/{file_id}/thumb", get(api::thumbs::thumb))
         .route("/api/storage", get(api::storage_info))
         .merge(upload_routes)
         .merge(relay_routes)

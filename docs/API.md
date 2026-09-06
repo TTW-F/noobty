@@ -85,9 +85,11 @@ Guarantees: the server's authoritative offset is the number of bytes **actually 
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/files/{file_id}` | Binary stream. `Content-Disposition` (ASCII fallback + RFC 5987 UTF-8 name). Full support for single-range `Range` requests (resumable download): `206` + `Content-Range`, unsatisfiable → `416` + `Content-Range: bytes */size`, malformed/foreign units → full `200`. |
+| GET | `/api/files` | File warehouse listing (newest first). Optional `?limit=` (default 500, max 1000), optional `?before=<file_id>` (strictly older than cursor) → `{ "files": [ { "file_id", "name", "size", "device_id", "uploaded_at", "expires_at" }, ... ] }`. |
+| GET | `/api/files/{file_id}` | Binary stream. Default `Content-Disposition: attachment` (ASCII fallback + RFC 5987 UTF-8 name). `?inline=1` or `?inline=true` → `inline` + image `Content-Type` when the name looks like a raster (lightbox / `<img>` streaming). Full support for single-range `Range` requests (resumable download): `206` + `Content-Range`, unsatisfiable → `416` + `Content-Range: bytes */size`, malformed/foreign units → full `200`. |
 | GET | `/api/files/{file_id}/meta` | `{ "file_id", "name", "size", "uploaded_at", "expires_at" }` |
-| DELETE | `/api/files/{file_id}` | Removes bytes + metadata + referencing messages. → 204 (404 if unknown). Broadcasts `file_deleted`. |
+| GET | `/api/files/{file_id}/thumb` | Small JPEG preview (≤96px). Raster images only (`png/jpg/gif/webp/bmp`), source ≤16 MiB. Cached under `{storage}/thumbs/`. Non-image / too large → `404`. `Cache-Control: public, max-age=604800, immutable`. |
+| DELETE | `/api/files/{file_id}` | Removes bytes + metadata + referencing messages (single-file + empty `file_group`s). → 204 (404 if unknown). Broadcasts `file_deleted`. |
 
 ## Storage policy
 

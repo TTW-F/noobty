@@ -9,6 +9,9 @@ import { api, clearIdentity, loadIdentity, saveIdentity, type StoredIdentity } f
 import { onIncomingMessage } from '../lib/shell'
 import { downloadFile, type DownloadHandle } from '../lib/download'
 import { sendFile, sendFileBatch, receiveRelay, type UploadHandle } from '../lib/send'
+import { inShell, shellDownloadToDownloads } from '../lib/shell'
+import { sweepAbandonedOpfsSaves } from '../lib/saveStream'
+import { closeLightbox } from '../lib/lightbox'
 import { HubSocket } from '../lib/ws'
 import type {
   ConnectionState,
@@ -34,15 +37,14 @@ export type DownloadState =
 
 export type AppView = 'chats' | 'files'
 
-/** 文件仓库条目:从各会话历史聚合出的文件 */
+/** 文件仓库条目:来自 GET /api/files 的中枢寄存清单 */
 export interface LibraryEntry {
   file: FileRef
-  messageId: string
-  conversationId: ConversationId
-  convName: string
+  deviceId: string
   fromName: string
   mine: boolean
-  createdAt: string
+  uploadedAt: string
+  expiresAt: string
 }
 
 /** 一个显示会话背后两条线程的分页游标(out = 我→对方,in = 我的收件箱) */
@@ -54,6 +56,47 @@ interface ThreadPages {
 }
 
 const PAGE = 25
+/** 常驻托盘客户端:每会话内存消息上限(仍可上翻回拉) */
+const MAX_MESSAGES_IN_MEMORY = 200
+/** 过期/已删文件标记上限,超出丢最旧键 */
+const MAX_DEAD_FILES = 64
+/** 下载终态(saved/error)保留时长后从 map 剔除,避免常驻堆积 */
+const DOWNLOAD_TERMINAL_TTL_MS = 8_000
+/** 窗口隐藏超过此时长后 park:丢掉消息窗与仓库(托盘关窗常挂着) */
+const HIDDEN_PARK_MS = 20_000
+
+/** 侧栏摘要只需 kind/text/计数/时间;file_group 不挂全量 FileRef[] */
+function slimPreview(m: Message): Message {
+  if (m.kind === 'file_group') {
+    const n = m.files?.length ?? 0
+    return {
+      message_id: m.message_id,
+      conversation_id: m.conversation_id,
+      from_device_id: m.from_device_id,
+      created_at: m.created_at,
+      kind: 'file_group',
+      text: n > 0 ? `${n} 个文件` : m.text,
+    }
+  }
+  if (m.kind === 'file' && m.file) {
+    return {
+      message_id: m.message_id,
+      conversation_id: m.conversation_id,
+      from_device_id: m.from_device_id,
+      created_at: m.created_at,
+      kind: 'file',
+      file: { file_id: m.file.file_id, name: m.file.name, size: m.file.size },
+    }
+  }
+  return {
+    message_id: m.message_id,
+    conversation_id: m.conversation_id,
+    from_device_id: m.from_device_id,
+    created_at: m.created_at,
+    kind: m.kind,
+    text: m.text,
+  }
+}
 
 interface HubState {
   status: ConnectionState
@@ -68,6 +111,8 @@ interface HubState {
   view: AppView
   library: LibraryEntry[]
   libraryStatus: 'idle' | 'loading' | 'ready'
+  libraryHasMore: boolean
+  libraryLoadingMore: boolean
   /** 当前活动会话是否为应用自动代选(用户一旦手动选择即失效) */
   activeConvIsAuto: boolean
   messages: Record<string, Message[]>
@@ -98,7 +143,8 @@ interface HubState {
   setActiveConv: (conv: ConversationId | null) => void
   setView: (view: AppView) => void
   loadLibrary: () => Promise<void>
-  deleteStoredFile: (file: FileRef, messageId: string) => void
+  loadLibraryMore: () => Promise<void>
+  deleteStoredFile: (file: FileRef) => void
   /** 应用代选默认会话:随设备在线状态可被再次纠正;用户手选后不再干预 */
   autoSelectConv: (conv: ConversationId) => void
   sendText: (conv: ConversationId, text: string) => Promise<boolean>
@@ -117,9 +163,14 @@ let socket: HubSocket | null = null
 const uploadHandles = new Map<string, UploadHandle>()
 const downloadHandles = new Map<string, DownloadHandle>()
 const historyInflight = new Map<string, Promise<void>>()
+const downloadClearTimers = new Map<string, ReturnType<typeof setTimeout>>()
 let seq = 0
 /** 本次页面会话是否成功连上过中枢:区分首次加载与断线重连 */
 let everConnected = false
+/** 托盘关窗/页签隐藏后进入 park:不持有消息窗,只留 lastMessages */
+let parked = false
+let parkTimer: ReturnType<typeof setTimeout> | null = null
+let visibilityHooked = false
 
 const newId = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${(seq++).toString(36)}`
 
@@ -129,6 +180,55 @@ function isAbort(err: unknown): boolean {
 
 export const useHub = create<HubState>((set, get) => {
   // ---------- 内部工具 ----------
+
+  /** 下载终态限期剔除:托盘常驻时 downloads map 否则只增不减 */
+  function setDownloadTerminal(fileId: string, state: DownloadState): void {
+    const prev = downloadClearTimers.get(fileId)
+    if (prev) clearTimeout(prev)
+    set((s) => ({ downloads: { ...s.downloads, [fileId]: state } }))
+    downloadClearTimers.set(
+      fileId,
+      setTimeout(() => {
+        downloadClearTimers.delete(fileId)
+        set((s) => {
+          const cur = s.downloads[fileId]
+          if (!cur || cur.status === 'downloading') return s
+          const next = { ...s.downloads }
+          delete next[fileId]
+          return { downloads: next }
+        })
+      }, DOWNLOAD_TERMINAL_TTL_MS),
+    )
+  }
+
+  function clearDownloadEntry(fileId: string): void {
+    const t = downloadClearTimers.get(fileId)
+    if (t) clearTimeout(t)
+    downloadClearTimers.delete(fileId)
+    set((s) => {
+      if (!(fileId in s.downloads)) return s
+      const next = { ...s.downloads }
+      delete next[fileId]
+      return { downloads: next }
+    })
+  }
+
+  /** 标记 dead 并裁剪到上限(插入序丢最旧) */
+  function markDeadFile(fileId: string, alsoFilterLibrary = true): void {
+    set((s) => {
+      const deadFiles: Record<string, true> = { ...s.deadFiles, [fileId]: true }
+      const keys = Object.keys(deadFiles)
+      if (keys.length > MAX_DEAD_FILES) {
+        for (const k of keys.slice(0, keys.length - MAX_DEAD_FILES)) delete deadFiles[k]
+      }
+      return {
+        deadFiles,
+        ...(alsoFilterLibrary
+          ? { library: s.library.filter((e) => e.file.file_id !== fileId) }
+          : {}),
+      }
+    })
+  }
 
   /** 线程键 → 显示键:发给我的消息归档进"与发送者的会话" */
   function uiConvKey(threadId: string, fromDeviceId: string): ConversationId {
@@ -143,17 +243,180 @@ export const useHub = create<HubState>((set, get) => {
     return `private:${get().me?.device_id ?? ''}`
   }
 
+  /** 侧栏摘要:不入消息列表(非活跃会话只靠 lastMessages 预览) */
+  function touchLastMessage(bucket: ConversationId, m: Message): void {
+    const brief = slimPreview(m)
+    set((s) => {
+      const last = s.lastMessages[bucket]
+      if (last && brief.created_at < last.created_at) return s
+      return { lastMessages: { ...s.lastMessages, [bucket]: brief } }
+    })
+  }
+
+  /** 是否正在持有该会话的消息窗口(活跃或已加载历史);park 时一律不持有 */
+  function holdingMessages(bucket: ConversationId, s: HubState = get()): boolean {
+    if (parked) return false
+    return (
+      s.activeConv === bucket ||
+      s.historyStatus[bucket] === 'ready' ||
+      s.historyStatus[bucket] === 'loading'
+    )
+  }
+
+  /** 关窗/隐藏一段时间后释放常驻内存;再显示时按需重拉 */
+  function parkResidentCaches(): void {
+    if (parked) return
+    parked = true
+    evictInactiveCaches(null)
+    closeLightbox()
+
+    // 丢掉失败/已完成的上传任务(其 .file 会钉住多 GiB 的 File 句柄);进行中的保留
+    set((s) => {
+      const downloads: typeof s.downloads = {}
+      for (const [id, d] of Object.entries(s.downloads)) {
+        if (d.status === 'downloading') downloads[id] = d
+      }
+      return {
+        library: [],
+        libraryStatus: 'idle' as const,
+        libraryHasMore: false,
+        libraryLoadingMore: false,
+        toasts: [],
+        deadFiles: {},
+        downloads,
+        uploads: s.uploads.filter((t) => t.status === 'uploading'),
+      }
+    })
+
+    const me = get().me
+    if (me) pruneSidebarMaps(get().devices, me.device_id)
+
+    // 无进行中的落盘时扫 OPFS 残留临时文件
+    if (downloadHandles.size === 0) void sweepAbandonedOpfsSaves()
+  }
+
+  /** 只保留大厅 + 仍在设备列表中的私聊摘要/未读 */
+  function pruneSidebarMaps(devices: Device[], meId: string): void {
+    const keep = new Set<string>(['lobby'])
+    for (const d of devices) {
+      if (d.device_id !== meId) keep.add(`private:${d.device_id}`)
+    }
+    set((s) => {
+      let changed = false
+      const lastMessages = { ...s.lastMessages }
+      const unread = { ...s.unread }
+      for (const k of Object.keys(lastMessages)) {
+        if (!keep.has(k)) {
+          delete lastMessages[k]
+          changed = true
+        }
+      }
+      for (const k of Object.keys(unread)) {
+        if (!keep.has(k)) {
+          delete unread[k]
+          changed = true
+        }
+      }
+      return changed ? { lastMessages, unread } : s
+    })
+  }
+
+  function resumeFromPark(): void {
+    if (!parked) return
+    parked = false
+    const conv = get().activeConv
+    if (conv) void loadHistory(conv)
+    if (get().view === 'files') void get().loadLibrary()
+  }
+
+  function hookVisibilityPark(): void {
+    if (visibilityHooked || typeof document === 'undefined') return
+    visibilityHooked = true
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        if (parkTimer) clearTimeout(parkTimer)
+        parkTimer = setTimeout(() => {
+          parkTimer = null
+          if (document.visibilityState === 'hidden') parkResidentCaches()
+        }, HIDDEN_PARK_MS)
+        return
+      }
+      if (parkTimer) {
+        clearTimeout(parkTimer)
+        parkTimer = null
+      }
+      resumeFromPark()
+    })
+  }
+
+  /**
+   * 切走会话时丢掉其消息窗口与分页游标。侧栏仍用 lastMessages;
+   * 再打开时 loadHistory 拉最新一页。避免 N 个会话各留 400 条。
+   */
+  function evictInactiveCaches(keep: ConversationId | null): void {
+    set((s) => {
+      const drop = (key: string) => key !== keep
+      let changed = false
+      const messages: Record<string, Message[]> = {}
+      for (const [k, list] of Object.entries(s.messages)) {
+        if (drop(k)) {
+          if (list.length) changed = true
+          continue
+        }
+        messages[k] = list
+      }
+      const historyStatus = { ...s.historyStatus }
+      const threadPages = { ...s.threadPages }
+      const hasMore = { ...s.hasMore }
+      const loadingMore = { ...s.loadingMore }
+      for (const k of Object.keys(historyStatus)) {
+        if (drop(k)) {
+          delete historyStatus[k]
+          changed = true
+        }
+      }
+      for (const k of Object.keys(threadPages)) {
+        if (drop(k)) {
+          delete threadPages[k]
+          changed = true
+        }
+      }
+      for (const k of Object.keys(hasMore)) {
+        if (drop(k)) {
+          delete hasMore[k]
+          changed = true
+        }
+      }
+      for (const k of Object.keys(loadingMore)) {
+        if (drop(k)) {
+          delete loadingMore[k]
+          changed = true
+        }
+      }
+      if (!changed) return s
+      return { messages, historyStatus, threadPages, hasMore, loadingMore }
+    })
+  }
+
   /** 把消息放入正确的显示会话(按线程键重映射),已存在则忽略 */
   function upsertMessage(m: Message): void {
     const bucket = uiConvKey(m.conversation_id, m.from_device_id)
     set((s) => {
+      const brief = slimPreview(m)
+      const last = s.lastMessages[bucket]
+      const lastMessages =
+        !last || brief.created_at >= last.created_at
+          ? { ...s.lastMessages, [bucket]: brief }
+          : s.lastMessages
+
+      // 非活跃且未持有窗口:只更新摘要,不堆积 messages
+      if (!holdingMessages(bucket, s)) {
+        return lastMessages === s.lastMessages ? s : { lastMessages }
+      }
+
       const list = s.messages[bucket] ?? []
       if (list.some((x) => x.message_id === m.message_id)) {
-        const last = s.lastMessages[bucket]
-        if (!last || m.created_at >= last.created_at) {
-          return { lastMessages: { ...s.lastMessages, [bucket]: m } }
-        }
-        return s
+        return lastMessages === s.lastMessages ? s : { lastMessages }
       }
       const pendingIndex = m.file
         ? list.findIndex(
@@ -167,13 +430,62 @@ export const useHub = create<HubState>((set, get) => {
         pendingIndex >= 0
           ? list.map((x, i) => (i === pendingIndex ? m : x))
           : [...list, m].sort((a, b) => a.created_at.localeCompare(b.created_at))
-      const last = s.lastMessages[bucket]
-      const lastMessages =
-        !last || m.created_at >= last.created_at
-          ? { ...s.lastMessages, [bucket]: m }
-          : s.lastMessages
-      return { messages: { ...s.messages, [bucket]: next }, lastMessages }
+      // 贴底滑动窗口,避免活跃会话在推送下无界增长
+      const capped =
+        next.length > MAX_MESSAGES_IN_MEMORY
+          ? next.slice(next.length - MAX_MESSAGES_IN_MEMORY)
+          : next
+      const hasMorePatch =
+        capped.length < next.length ? { ...s.hasMore, [bucket]: true } : undefined
+      return {
+        messages: { ...s.messages, [bucket]: capped },
+        lastMessages,
+        ...(hasMorePatch ? { hasMore: hasMorePatch } : {}),
+      }
     })
+    // 仓库已加载时,把新文件补进清单(避免必须手动刷新)
+    if (get().libraryStatus === 'ready') mergeFilesIntoLibrary(m)
+  }
+
+  function mergeFilesIntoLibrary(m: Message): void {
+    const me = get().me
+    if (!me) return
+    const files =
+      m.kind === 'file' && m.file
+        ? [m.file]
+        : m.kind === 'file_group'
+          ? (m.files ?? [])
+          : []
+    if (files.length === 0) return
+    const mine = m.from_device_id === me.device_id
+    const fromName = mine
+      ? me.name
+      : (get().devices.find((d) => d.device_id === m.from_device_id)?.name ?? '已离开的设备')
+    const uploadedAt = m.created_at
+    // 列表 API 才有精确 expires_at;增量补丁用保留天数估算,下次刷新会纠正
+    const days = get().storage?.retention_days ?? 5
+    const expiresAt = new Date(new Date(uploadedAt).getTime() + days * 86400_000).toISOString()
+    set((s) => {
+      const known = new Set(s.library.map((e) => e.file.file_id))
+      const added: LibraryEntry[] = []
+      for (const f of files) {
+        if (known.has(f.file_id)) continue
+        added.push({
+          file: f,
+          deviceId: m.from_device_id,
+          fromName,
+          mine,
+          uploadedAt,
+          expiresAt,
+        })
+      }
+      if (added.length === 0) return s
+      const library = [...added, ...s.library].sort((a, b) =>
+        b.uploadedAt.localeCompare(a.uploadedAt),
+      )
+      return { library }
+    })
+    get().refreshStorage()
   }
 
   function bumpUnread(conv: ConversationId, fromDeviceId: string): void {
@@ -186,16 +498,34 @@ export const useHub = create<HubState>((set, get) => {
     socket?.send({ type: 'ack_message', message_id: m.message_id })
   }
 
-  /** 合并一批消息进指定显示会话(去重 + 按时间排序),返回合并结果 */
-  function mergeInto(conv: ConversationId, incoming: Message[]): void {
+  /** 合并一批消息进指定显示会话(去重 + 按时间排序)。超限时滑动窗口。 */
+  function mergeInto(
+    conv: ConversationId,
+    incoming: Message[],
+    opts?: { preferOlder?: boolean },
+  ): void {
     if (incoming.length === 0) return
     set((s) => {
       const existing = s.messages[conv] ?? []
       const seen = new Set(existing.map((m) => m.message_id))
       const fresh = incoming.filter((m) => !seen.has(m.message_id))
       if (fresh.length === 0) return s
-      const merged = [...existing, ...fresh].sort((a, b) => a.created_at.localeCompare(b.created_at))
-      return { messages: { ...s.messages, [conv]: merged } }
+      let merged = [...existing, ...fresh].sort((a, b) => a.created_at.localeCompare(b.created_at))
+      let hasMorePatch: Record<string, boolean> | undefined
+      if (merged.length > MAX_MESSAGES_IN_MEMORY) {
+        if (opts?.preferOlder) {
+          // 正在往上翻:保留较旧窗口,丢掉最底部多余新消息
+          merged = merged.slice(0, MAX_MESSAGES_IN_MEMORY)
+        } else {
+          // 默认贴底:保留最新窗口,丢掉顶部旧消息并允许再拉
+          merged = merged.slice(merged.length - MAX_MESSAGES_IN_MEMORY)
+          hasMorePatch = { ...s.hasMore, [conv]: true }
+        }
+      }
+      return {
+        messages: { ...s.messages, [conv]: merged },
+        ...(hasMorePatch ? { hasMore: hasMorePatch } : {}),
+      }
     })
   }
 
@@ -230,6 +560,7 @@ export const useHub = create<HubState>((set, get) => {
       // 大厅是单线程广播,无需双线程合并
       if (conv === 'lobby') {
         const { messages } = await api.history('lobby', me.device_id, { limit: PAGE })
+        if (get().activeConv !== conv) return
         mergeInto(conv, messages)
         const pages: ThreadPages = {
           outCursor: messages[messages.length - 1]?.message_id,
@@ -248,21 +579,15 @@ export const useHub = create<HubState>((set, get) => {
         api.history(conv, me.device_id, { limit: PAGE }),
         api.history(inboxThread(), me.device_id, { limit: PAGE }),
       ])
-      // 收件箱按发送者分桶:对方的部分进入本会话,其他发送者的归各自会话
+      if (get().activeConv !== conv) return
+      // 收件箱按发送者分桶:只入当前会话;其他发送者只刷新侧栏摘要,避免顺带填满别的会话窗口
       const toConv: Message[] = []
-      const othersBySender = new Map<string, Message[]>()
       for (const m of inbox.messages) {
         const bucket = uiConvKey(m.conversation_id, m.from_device_id)
-        if (bucket === conv) {
-          toConv.push(m)
-          continue
-        }
-        const arr = othersBySender.get(bucket)
-        if (arr) arr.push(m)
-        else othersBySender.set(bucket, [m])
+        if (bucket === conv) toConv.push(m)
+        else touchLastMessage(bucket, m)
       }
       mergeInto(conv, [...out.messages, ...toConv])
-      for (const [bucket, msgs] of othersBySender) mergeInto(bucket, msgs)
 
       const outCursor = out.messages[out.messages.length - 1]?.message_id
       const inCursor = toConv[toConv.length - 1]?.message_id
@@ -278,6 +603,7 @@ export const useHub = create<HubState>((set, get) => {
         hasMore: { ...s.hasMore, [conv]: pages.outHasMore || pages.inHasMore },
       }))
     } catch {
+      if (get().activeConv !== conv) return
       set((s) => {
         const next = { ...s.historyStatus }
         delete next[conv]
@@ -303,7 +629,8 @@ export const useHub = create<HubState>((set, get) => {
             api
               .history(conv, me.device_id, { before: pages!.outCursor, limit: PAGE })
               .then(({ messages }) => {
-                mergeInto(conv, messages)
+                if (get().activeConv !== conv) return
+                mergeInto(conv, messages, { preferOlder: true })
                 set((s) => {
                   const p = s.threadPages[conv]
                   return {
@@ -326,10 +653,14 @@ export const useHub = create<HubState>((set, get) => {
             api
               .history(inboxThread(), me.device_id, { before: pages!.inCursor, limit: PAGE })
               .then(({ messages }) => {
+                if (get().activeConv !== conv) return
+                const forConv: Message[] = []
                 for (const m of messages) {
-                  mergeInto(uiConvKey(m.conversation_id, m.from_device_id), [m])
+                  const bucket = uiConvKey(m.conversation_id, m.from_device_id)
+                  if (bucket === conv) forConv.push(m)
+                  else touchLastMessage(bucket, m)
                 }
-                const forConv = messages.filter((m) => uiConvKey(m.conversation_id, m.from_device_id) === conv)
+                if (forConv.length) mergeInto(conv, forConv, { preferOlder: true })
                 set((s) => {
                   const p = s.threadPages[conv]
                   return {
@@ -348,6 +679,7 @@ export const useHub = create<HubState>((set, get) => {
           )
         }
         await Promise.all(requests)
+        if (get().activeConv !== conv) return
         set((s) => {
           const p = s.threadPages[conv]
           return {
@@ -356,6 +688,7 @@ export const useHub = create<HubState>((set, get) => {
           }
         })
       } catch {
+        if (get().activeConv !== conv) return
         set((s) => ({ loadingMore: { ...s.loadingMore, [conv]: false } }))
         get().pushToast('error', '更早的消息加载失败,请重试')
       }
@@ -419,18 +752,21 @@ export const useHub = create<HubState>((set, get) => {
         if (c.conversation_id === inboxThread()) continue
         if (c.last_message && !get().messages[c.conversation_id]?.length) {
           const brief = c.last_message
-          lastMessages[c.conversation_id] = {
+          const kind: Message['kind'] =
+            brief.kind === 'file_group' ? 'file_group' : brief.kind === 'file' ? 'file' : 'text'
+          lastMessages[c.conversation_id] = slimPreview({
             message_id: brief.message_id,
             conversation_id: c.conversation_id,
             from_device_id: '',
             created_at: brief.created_at,
-            kind: brief.kind === 'file' ? 'file' : 'text',
+            kind,
             text: brief.preview ?? undefined,
-          }
+          })
         }
       }
       patch.lastMessages = lastMessages
       set(patch)
+      if (me) pruneSidebarMaps(devices, me.device_id)
       get().refreshStorage()
       await probeLobby()
     } catch {
@@ -499,19 +835,20 @@ export const useHub = create<HubState>((set, get) => {
         bumpUnread(bucket, m.from_device_id)
         ack(m)
         // 托盘壳增强:系统通知 + 文件自动接收(仅他人消息)。
-        // 抑制规则学桌面 IM:只有"窗口聚焦且正看着该会话"才不打扰;最小化/被遮挡/失焦都通知。
+        // 通知抑制学桌面 IM:聚焦且正看着该会话时不弹;自动接收仍照常落盘。
         if (m.from_device_id !== get().me?.device_id) {
           const viewingNow = document.hasFocus() && bucket === get().activeConv
-          if (!viewingNow) {
-            const sender = get().devices.find((d) => d.device_id === m.from_device_id)
-            void onIncomingMessage({
+          const sender = get().devices.find((d) => d.device_id === m.from_device_id)
+          void onIncomingMessage(
+            {
               senderName: sender?.name ?? '局域网设备',
               kind: m.kind,
               text: m.text,
               file: m.file,
               files: m.files,
-            })
-          }
+            },
+            { notify: !viewingNow },
+          )
         }
         break
       }
@@ -552,8 +889,9 @@ export const useHub = create<HubState>((set, get) => {
         break
       }
       case 'file_deleted': {
-        // 寄存字节被清理(级联删除或到期清理):文件卡转为不可取件状态
-        set((s) => ({ deadFiles: { ...s.deadFiles, [frame.file_id]: true } }))
+        // 寄存字节被清理:文件卡不可取件,并从仓库列表移除
+        markDeadFile(frame.file_id)
+        get().refreshStorage()
         break
       }
       case 'relay_offer': {
@@ -573,11 +911,10 @@ export const useHub = create<HubState>((set, get) => {
         set({ status })
         if (status === 'online') {
           if (everConnected) {
-            // 重连:推送不可靠,按各会话两条线程的最新游标补拉
+            // 重连:快照刷新侧栏;消息补拉只针对当前持有窗口的会话(其余切回时再 loadHistory)
             void syncSnapshot()
-            for (const conv of Object.keys(get().historyStatus)) {
-              if (get().historyStatus[conv] === 'ready') catchUpImpl(conv)
-            }
+            const conv = get().activeConv
+            if (conv && get().historyStatus[conv] === 'ready') catchUpImpl(conv)
           } else {
             everConnected = true
             void syncSnapshot()
@@ -633,6 +970,14 @@ export const useHub = create<HubState>((set, get) => {
           ),
         }))
         get().pushToast('error', `${file.name}:${message}`)
+        // 失败任务短暂保留以便重试;超时丢掉 File 句柄,避免常驻托盘钉住大文件
+        setTimeout(() => {
+          set((s) => {
+            const cur = s.uploads.find((t) => t.id === task.id)
+            if (!cur || cur.status !== 'error') return s
+            return { uploads: s.uploads.filter((t) => t.id !== task.id) }
+          })
+        }, 60_000)
       })
   }
 
@@ -678,18 +1023,12 @@ export const useHub = create<HubState>((set, get) => {
     handle.promise
       .then(() => {
         downloadHandles.delete(file.file_id)
-        set((s) => ({
-          downloads: { ...s.downloads, [file.file_id]: { status: 'saved' } },
-        }))
+        setDownloadTerminal(file.file_id, { status: 'saved' })
       })
       .catch(() => {
         downloadHandles.delete(file.file_id)
         // 实时窗口错过:清掉进度,等文件消息到达后用户点「取件」走磁盘路径
-        set((s) => {
-          const next = { ...s.downloads }
-          delete next[file.file_id]
-          return { downloads: next }
-        })
+        clearDownloadEntry(file.file_id)
       })
   }
 
@@ -707,6 +1046,8 @@ export const useHub = create<HubState>((set, get) => {
     view: 'chats',
     library: [],
     libraryStatus: 'idle',
+    libraryHasMore: false,
+    libraryLoadingMore: false,
     messages: {},
     lastMessages: {},
     historyStatus: {},
@@ -723,6 +1064,7 @@ export const useHub = create<HubState>((set, get) => {
     toasts: [],
 
     boot: () => {
+      hookVisibilityPark()
       const identity = loadIdentity()
       if (!identity) return
       set({ me: identity })
@@ -730,6 +1072,7 @@ export const useHub = create<HubState>((set, get) => {
     },
 
     register: async (name) => {
+      hookVisibilityPark()
       const identity = await api.registerDevice(name)
       saveIdentity(identity)
       set({ me: identity })
@@ -755,6 +1098,13 @@ export const useHub = create<HubState>((set, get) => {
       clearIdentity()
       socket?.close()
       socket = null
+      for (const t of downloadClearTimers.values()) clearTimeout(t)
+      downloadClearTimers.clear()
+      if (parkTimer) {
+        clearTimeout(parkTimer)
+        parkTimer = null
+      }
+      parked = false
       set({
         me: null,
         devices: [],
@@ -765,6 +1115,7 @@ export const useHub = create<HubState>((set, get) => {
         hasMore: {},
         loadingMore: {},
         unread: {},
+        downloads: {},
         deadFiles: {},
         lobbySupported: null,
         activeConv: null,
@@ -772,6 +1123,8 @@ export const useHub = create<HubState>((set, get) => {
         view: 'chats',
         library: [],
         libraryStatus: 'idle',
+        libraryHasMore: false,
+        libraryLoadingMore: false,
         status: 'connecting',
       })
       everConnected = false
@@ -789,76 +1142,110 @@ export const useHub = create<HubState>((set, get) => {
         if (conv) delete unread[conv]
         return { activeConv: conv, unread, activeConvIsAuto: false }
       })
+      evictInactiveCaches(conv)
       if (conv) void loadHistory(conv)
     },
 
     setView: (view) => {
+      if (view !== 'files' && get().view === 'files') {
+        // 常驻托盘:离开仓库即丢掉翻页清单,再进时重拉首页
+        set({
+          view,
+          library: [],
+          libraryStatus: 'idle',
+          libraryHasMore: false,
+          libraryLoadingMore: false,
+        })
+        return
+      }
       set({ view })
       if (view === 'files' && get().libraryStatus === 'idle') void get().loadLibrary()
     },
 
-    /** 文件仓库:聚合各会话历史里的文件消息(每会话取最近 100 条) */
+    /** 文件仓库:分页拉取中枢寄存清单(GET /api/files) */
     loadLibrary: async () => {
       const me = get().me
       if (!me || get().libraryStatus === 'loading') return
       set({ libraryStatus: 'loading' })
       try {
-        const convs: Array<{ id: ConversationId; name: string }> = [{ id: 'lobby', name: '大厅' }]
-        for (const d of get().devices) {
-          if (d.device_id !== me.device_id) convs.push({ id: `private:${d.device_id}`, name: d.name })
-        }
-        const pages = await Promise.all(
-          convs.map(async (c) => ({
-            ...c,
-            messages: await api
-              .history(c.id, me.device_id, { limit: 100 })
-              .then((r) => r.messages)
-              .catch(() => [] as Message[]),
-          })),
-        )
-        const byFile = new Map<string, LibraryEntry>()
-        for (const page of pages) {
-          for (const m of page.messages) {
-            const files =
-              m.kind === 'file' && m.file
-                ? [m.file]
-                : m.kind === 'file_group'
-                  ? (m.files ?? [])
-                  : []
-            for (const f of files) {
-              if (byFile.has(f.file_id)) continue
-              const mine = m.from_device_id === me.device_id
-              byFile.set(f.file_id, {
-                file: f,
-                messageId: m.message_id,
-                conversationId: page.id,
-                convName: page.name,
-                fromName: mine ? me.name : (get().devices.find((d) => d.device_id === m.from_device_id)?.name ?? '已离开的设备'),
-                mine,
-                createdAt: m.created_at,
-              })
-            }
+        const pageSize = 100
+        const [{ files }, storage] = await Promise.all([
+          api.listFiles(pageSize),
+          api.storage().catch(() => null),
+        ])
+        const library: LibraryEntry[] = files.map((f) => {
+          const mine = f.device_id === me.device_id
+          const fromName = mine
+            ? me.name
+            : (get().devices.find((d) => d.device_id === f.device_id)?.name ?? '已离开的设备')
+          return {
+            file: { file_id: f.file_id, name: f.name, size: f.size },
+            deviceId: f.device_id,
+            fromName,
+            mine,
+            uploadedAt: f.uploaded_at,
+            expiresAt: f.expires_at,
           }
-        }
-        const library = [...byFile.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        set({ library, libraryStatus: 'ready' })
+        })
+        set({
+          library,
+          libraryStatus: 'ready',
+          libraryHasMore: files.length >= pageSize,
+          libraryLoadingMore: false,
+          ...(storage ? { storage } : {}),
+        })
       } catch {
-        set({ libraryStatus: 'ready' })
+        set({ libraryStatus: 'ready', libraryHasMore: false, libraryLoadingMore: false })
         get().pushToast('error', '文件仓库加载失败,请重试')
       }
     },
 
-    /** 仓库里删除寄存文件:只删文件字节,聊天消息保留(显示"已过期或已删除") */
+    loadLibraryMore: async () => {
+      const me = get().me
+      if (!me || get().libraryLoadingMore || !get().libraryHasMore) return
+      const cursor = get().library.at(-1)?.file.file_id
+      if (!cursor) return
+      set({ libraryLoadingMore: true })
+      try {
+        const pageSize = 100
+        const { files } = await api.listFiles(pageSize, cursor)
+        const known = new Set(get().library.map((e) => e.file.file_id))
+        const added: LibraryEntry[] = []
+        for (const f of files) {
+          if (known.has(f.file_id)) continue
+          const mine = f.device_id === me.device_id
+          const fromName = mine
+            ? me.name
+            : (get().devices.find((d) => d.device_id === f.device_id)?.name ?? '已离开的设备')
+          added.push({
+            file: { file_id: f.file_id, name: f.name, size: f.size },
+            deviceId: f.device_id,
+            fromName,
+            mine,
+            uploadedAt: f.uploaded_at,
+            expiresAt: f.expires_at,
+          })
+        }
+        set((s) => ({
+          library: [...s.library, ...added],
+          libraryHasMore: files.length >= pageSize,
+          libraryLoadingMore: false,
+        }))
+      } catch {
+        set({ libraryLoadingMore: false })
+        get().pushToast('error', '加载更多文件失败')
+      }
+    },
+
+    /** 仓库里删除寄存文件:删字节与相关消息;聊天侧靠 file_deleted 标过期 */
     deleteStoredFile: (file) => {
       const me = get().me
       if (!me) return
       void (async () => {
         try {
           await api.deleteFile(file.file_id, me.device_id)
-          set((s) => ({
-            deadFiles: { ...s.deadFiles, [file.file_id]: true },
-            library: s.library.filter((e) => e.file.file_id !== file.file_id),
-          }))
+          markDeadFile(file.file_id)
+          get().refreshStorage()
         } catch (err) {
           get().pushToast('error', err instanceof Error ? err.message : '删除失败')
         }
@@ -872,6 +1259,7 @@ export const useHub = create<HubState>((set, get) => {
         delete unread[conv]
         return { activeConv: conv, unread, activeConvIsAuto: true }
       })
+      evictInactiveCaches(conv)
       void loadHistory(conv)
     },
 
@@ -948,6 +1336,13 @@ export const useHub = create<HubState>((set, get) => {
             ),
           }))
           get().pushToast('error', message)
+          setTimeout(() => {
+            set((s) => {
+              const cur = s.uploads.find((t) => t.id === task.id)
+              if (!cur || cur.status !== 'error') return s
+              return { uploads: s.uploads.filter((t) => t.id !== task.id) }
+            })
+          }, 60_000)
         })
     },
 
@@ -975,12 +1370,69 @@ export const useHub = create<HubState>((set, get) => {
 
     download: (file) => {
       if (downloadHandles.has(file.file_id)) return
+      {
+        const t = downloadClearTimers.get(file.file_id)
+        if (t) clearTimeout(t)
+        downloadClearTimers.delete(file.file_id)
+      }
       set((s) => ({
         downloads: {
           ...s.downloads,
           [file.file_id]: { status: 'downloading', receivedBytes: 0, totalBytes: file.size, speed: 0 },
         },
       }))
+
+      // 托盘壳:流式落到可配置接收目录(可写 D: 等),避免浏览器 OPFS/C 盘缓存。
+      if (inShell) {
+        const startedAt = Date.now()
+        const controller = { cancelled: false }
+        const promise = shellDownloadToDownloads(file, ({ received, total }) => {
+          if (controller.cancelled) return
+          const elapsed = Math.max(0.25, (Date.now() - startedAt) / 1000)
+          set((s) => {
+            const cur = s.downloads[file.file_id]
+            if (!cur || cur.status !== 'downloading') return s
+            return {
+              downloads: {
+                ...s.downloads,
+                [file.file_id]: {
+                  status: 'downloading',
+                  receivedBytes: received,
+                  totalBytes: total || file.size,
+                  speed: received / elapsed,
+                },
+              },
+            }
+          })
+        }).then((path) => {
+          if (!path) throw new Error('壳下载失败')
+        })
+        const handle: DownloadHandle = {
+          promise,
+          cancel: () => {
+            controller.cancelled = true
+          },
+        }
+        downloadHandles.set(file.file_id, handle)
+        handle.promise
+          .then(() => {
+            setDownloadTerminal(file.file_id, { status: 'saved' })
+          })
+          .catch((err: unknown) => {
+            if (controller.cancelled || isAbort(err)) {
+              clearDownloadEntry(file.file_id)
+              return
+            }
+            setDownloadTerminal(file.file_id, {
+              status: 'error',
+              message: err instanceof Error ? err.message : '下载失败',
+            })
+            get().pushToast('error', `${file.name}:下载失败`)
+          })
+          .finally(() => downloadHandles.delete(file.file_id))
+        return
+      }
+
       const handle = downloadFile(file, ({ receivedBytes, totalBytes, speed }) => {
         set((s) => {
           const cur = s.downloads[file.file_id]
@@ -996,23 +1448,17 @@ export const useHub = create<HubState>((set, get) => {
       downloadHandles.set(file.file_id, handle)
       handle.promise
         .then(() => {
-          set((s) => ({ downloads: { ...s.downloads, [file.file_id]: { status: 'saved' } } }))
+          setDownloadTerminal(file.file_id, { status: 'saved' })
         })
         .catch((err: unknown) => {
           if (isAbort(err)) {
-            set((s) => {
-              const next = { ...s.downloads }
-              delete next[file.file_id]
-              return { downloads: next }
-            })
+            clearDownloadEntry(file.file_id)
             return
           }
-          set((s) => ({
-            downloads: {
-              ...s.downloads,
-              [file.file_id]: { status: 'error', message: err instanceof Error ? err.message : '下载失败' },
-            },
-          }))
+          setDownloadTerminal(file.file_id, {
+            status: 'error',
+            message: err instanceof Error ? err.message : '下载失败',
+          })
           get().pushToast('error', `${file.name}:下载失败`)
         })
         .finally(() => downloadHandles.delete(file.file_id))

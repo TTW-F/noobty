@@ -102,7 +102,7 @@
           const res = await fetch(url + '/api/healthz', { signal: AbortSignal.timeout(5000) })
           if (!res.ok) throw new Error('HTTP ' + res.status)
           await window.__TAURI__.core.invoke('set_hub_url', { url })
-          location.replace(url)
+          await window.__TAURI__.core.invoke('open_hub')
         } catch (err) {
           errorEl.textContent = '连不上这个地址:' + String(err).slice(0, 80)
           btn.disabled = false

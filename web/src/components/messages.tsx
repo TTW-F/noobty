@@ -1,6 +1,5 @@
 // 消息原子组件:文本气泡、文件卡、图片卡、文件组卡、图片灯箱
 import { memo, useEffect, useMemo, useState } from 'react'
-import { create } from 'zustand'
 import {
   ArrowsClockwise,
   Checks,
@@ -17,33 +16,20 @@ import { useHub } from '../store/hub'
 import { Button, ConfirmDialog, Dialog, Progress } from './ui'
 import { KIND_ICON, KIND_LABEL, fileKind, isImage } from '../lib/files'
 import { formatBytes, formatClock, formatSpeed } from '../lib/format'
-import type { Device, FileRef, Message } from '../lib/types'
+import { useLightbox } from '../lib/lightbox'
+import type { FileRef, Message } from '../lib/types'
 
 // ---------- 图片灯箱 ----------
 
-interface LightboxState {
-  file: FileRef | null
-  objectUrl: string | null
-  open: (file: FileRef, objectUrl: string) => void
-  close: () => void
-}
-
-const useLightbox = create<LightboxState>((set) => ({
-  file: null,
-  objectUrl: null,
-  open: (file, objectUrl) => set({ file, objectUrl }),
-  close: () => set({ file: null, objectUrl: null }),
-}))
-
 export function Lightbox() {
   const file = useLightbox((s) => s.file)
-  const objectUrl = useLightbox((s) => s.objectUrl)
+  const src = useLightbox((s) => s.src)
   const close = useLightbox((s) => s.close)
   return (
     <Dialog open={file !== null} onClose={close} width="max-w-[min(92vw,960px)]" dim="deep">
       <div className="flex flex-col gap-3">
-        {objectUrl && file && (
-          <img src={objectUrl} alt={file.name} className="max-h-[76vh] w-full self-center rounded-[10px] object-contain" />
+        {src && file && (
+          <img src={src} alt={file.name} className="max-h-[76vh] w-full self-center rounded-[10px] object-contain" />
         )}
         <div className="flex items-center gap-2">
           <span className="min-w-0 flex-1 truncate text-[13px] font-medium">{file?.name}</span>
@@ -186,60 +172,67 @@ export function FileCard({ file, mine, compact = false }: { file: FileRef; mine:
 
 // ---------- 图片卡 ----------
 
-export function ImageCard({ file }: { file: FileRef }) {
-  const [loaded, setLoaded] = useState(false)
-  const [failed, setFailed] = useState(false)
-  const [objectUrl, setObjectUrl] = useState<string | null>(null)
-  const openLightbox = useLightbox((s) => s.open)
-  const src = useMemo(() => `/api/files/${encodeURIComponent(file.file_id)}`, [file.file_id])
+/** 灯箱才拉原图;超过此大小点按仍用 FileCard 取件,避免整文件进堆。 */
+const LIGHTBOX_MAX_BYTES = 8 * 1024 * 1024
 
-  // 走 fetch(可被 mock 拦截)取 blob,而非 <img src> 直连——后者绕过 fetch 层
-  useEffect(
-    function loadImage() {
-      let revoked: string | null = null
-      let alive = true
-      setLoaded(false)
-      setFailed(false)
-      setObjectUrl(null)
-      fetch(src)
-        .then((res) => {
-          if (!res.ok) throw new Error(String(res.status))
-          return res.blob()
-        })
-        .then((blob) => {
-          if (!alive) return
-          revoked = URL.createObjectURL(blob)
-          setObjectUrl(revoked)
-        })
-        .catch(() => {
-          if (alive) setFailed(true)
-        })
-      return () => {
-        alive = false
-        if (revoked) URL.revokeObjectURL(revoked)
-      }
-    },
-    [src],
+export function ImageCard({ file }: { file: FileRef }) {
+  const [visible, setVisible] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [thumbFailed, setThumbFailed] = useState(false)
+  const [rootEl, setRootEl] = useState<HTMLButtonElement | null>(null)
+  const openLightbox = useLightbox((s) => s.open)
+  const thumbSrc = useMemo(() => `/api/files/${encodeURIComponent(file.file_id)}/thumb`, [file.file_id])
+  // inline=1: hub 用 Content-Disposition:inline + image/*，浏览器流式解码，不经 JS Blob
+  const fullSrc = useMemo(
+    () => `/api/files/${encodeURIComponent(file.file_id)}?inline=1`,
+    [file.file_id],
   )
 
-  if (failed) return <FileCard file={file} mine={false} />
+  useEffect(() => {
+    if (!rootEl || typeof IntersectionObserver === 'undefined') {
+      setVisible(true)
+      return
+    }
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          setVisible(true)
+          io.disconnect()
+        }
+      },
+      { rootMargin: '200px' },
+    )
+    io.observe(rootEl)
+    return () => io.disconnect()
+  }, [rootEl])
+
+  if (thumbFailed) return <FileCard file={file} mine={false} />
+
+  const openFull = () => {
+    if (file.size > LIGHTBOX_MAX_BYTES) return
+    openLightbox(file, fullSrc)
+  }
 
   return (
     <button
-      onClick={() => objectUrl && openLightbox(file, objectUrl)}
-      className="relative block max-w-[340px] cursor-zoom-in overflow-hidden rounded-[14px] bg-surface-2"
-      title={`${file.name} · ${formatBytes(file.size)} · 点按放大`}
+      ref={setRootEl}
+      onClick={openFull}
+      className={`relative block max-w-[340px] overflow-hidden rounded-[14px] bg-surface-2 ${
+        file.size > LIGHTBOX_MAX_BYTES ? 'cursor-default' : 'cursor-zoom-in'
+      }`}
+      title={`${file.name} · ${formatBytes(file.size)}${file.size > LIGHTBOX_MAX_BYTES ? '' : ' · 点按放大'}`}
     >
-      {objectUrl && (
+      {visible && (
         <img
-          src={objectUrl}
+          src={thumbSrc}
           alt={file.name}
           onLoad={() => setLoaded(true)}
+          onError={() => setThumbFailed(true)}
           className={`max-h-72 w-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'h-44 opacity-0'}`}
         />
       )}
-      {!objectUrl && <div className="h-36 w-72" />}
-      {objectUrl && loaded && (
+      {!visible && <div className="h-36 w-72" />}
+      {loaded && (
         <span className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-black/65 to-transparent px-3 pb-2 pt-6">
           <span className="min-w-0 flex-1 truncate text-left text-[12.5px] font-medium text-white">{file.name}</span>
           <span className="num shrink-0 text-[11.5px] text-white/85">{formatBytes(file.size)}</span>
@@ -302,10 +295,10 @@ interface MessageRowProps {
   message: Message
   mine: boolean
   grouped: boolean
-  sender: Device | undefined
+  senderName: string | undefined
 }
 
-export const MessageRow = memo(function MessageRow({ message, mine, grouped, sender }: MessageRowProps) {
+export const MessageRow = memo(function MessageRow({ message, mine, grouped, senderName }: MessageRowProps) {
   const deleteMessage = useHub((s) => s.deleteMessage)
   const pushToast = useHub((s) => s.pushToast)
   const [confirming, setConfirming] = useState(false)
@@ -331,12 +324,16 @@ export const MessageRow = memo(function MessageRow({ message, mine, grouped, sen
             grouped ? 'opacity-0' : ''
           }`}
         >
-          {sender ? <span className="text-[11px] font-semibold">{sender.name.slice(0, 1)}</span> : <PlugsFallback />}
+          {senderName ? (
+            <span className="text-[11px] font-semibold">{senderName.slice(0, 1)}</span>
+          ) : (
+            <PlugsFallback />
+          )}
         </span>
       )}
       <div className={`flex min-w-0 flex-col ${mine ? 'items-end' : 'items-start'} anim-in`}>
-        {!mine && !grouped && sender && (
-          <span className="mb-1 px-1 text-[11.5px] text-muted">{sender.name}</span>
+        {!mine && !grouped && senderName && (
+          <span className="mb-1 px-1 text-[11.5px] text-muted">{senderName}</span>
         )}
         <MessageBody message={message} mine={mine} />
       </div>

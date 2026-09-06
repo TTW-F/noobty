@@ -10,13 +10,17 @@ import {
   HardDrives,
   Moon,
   PencilSimple,
+  QrCode,
   Sun,
 } from '@phosphor-icons/react'
 import { useHub } from '../store/hub'
 import { Dialog, IconButton, PresenceDot } from './ui'
 import { StorageMeter } from './StorageMeter'
+import { SavePathSettings } from './SavePathSettings'
 import { deviceIcon } from '../lib/files'
 import { formatRelative } from '../lib/format'
+import { hubInviteQrSvg } from '../lib/qr'
+import { inShell } from '../lib/shell'
 import { useTheme } from '../hooks/ui'
 import type { ConversationId, Message } from '../lib/types'
 
@@ -59,20 +63,28 @@ interface ConvSummary {
   at?: string
 }
 
-function summarize(list: Message[] | undefined, fallback: Message | undefined): ConvSummary {
-  const m = list && list.length > 0 ? list[list.length - 1] : fallback
-  if (!m) return { kind: undefined, files: 0 }
+function summarize(msg: Message | undefined): ConvSummary {
+  if (!msg) return { kind: undefined, files: 0 }
+  let files = 0
+  if (msg.kind === 'file') files = 1
+  else if (msg.kind === 'file_group') {
+    files = msg.files?.length ?? 0
+    // 无 files 时(会话列表 brief)用 text 当预览文案,files 保持 0
+  }
   return {
-    kind: m.kind,
-    text: m.text,
-    files: m.kind === 'file_group' ? (m.files?.length ?? 0) : m.kind === 'file' ? 1 : 0,
-    at: m.created_at,
+    kind: msg.kind,
+    text: msg.text,
+    files,
+    at: msg.created_at,
   }
 }
 
 function summaryText(s: ConvSummary): string {
   if (s.kind === 'file') return '[文件]'
-  if (s.kind === 'file_group') return `[${s.files} 个文件]`
+  if (s.kind === 'file_group') {
+    if (s.files > 0) return `[${s.files} 个文件]`
+    return s.text ? `[${s.text}]` : '[文件组]'
+  }
   return s.text ?? ''
 }
 
@@ -93,10 +105,10 @@ function ConversationRow({
   m2?: boolean
   onSelect: () => void
 }) {
-  const local = useHub((s) => s.messages[conv])
+  // 只用 lastMessages:勿订阅 messages[conv],否则活跃会话每条推送都拖着整列侧栏重渲染
   const summaryMsg = useHub((s) => s.lastMessages[conv])
   const unread = useHub((s) => s.unread[conv] ?? 0)
-  const summary = useMemo(() => summarize(local, summaryMsg), [local, summaryMsg])
+  const summary = useMemo(() => summarize(summaryMsg), [summaryMsg])
   const Icon = isLobby ? Broadcast : deviceIcon(name)
 
   return (
@@ -149,8 +161,12 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const lobbySupported = useHub((s) => s.lobbySupported)
   const [theme, toggleTheme] = useTheme()
   const [copied, setCopied] = useState(false)
+  const [inviteOpen, setInviteOpen] = useState(false)
   const [renaming, setRenaming] = useState(false)
   const [draftName, setDraftName] = useState('')
+
+  const hubUrl = `${location.protocol}//${location.host}`
+  const inviteQr = useMemo(() => hubInviteQrSvg(hubUrl), [hubUrl])
 
   const others = devices.filter((d) => d.device_id !== me?.device_id)
   // 在线优先,其余按名字
@@ -160,7 +176,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
 
   const copyHubAddress = async () => {
     try {
-      await navigator.clipboard.writeText(location.host)
+      await navigator.clipboard.writeText(hubUrl)
       setCopied(true)
       setTimeout(() => setCopied(false), 1600)
     } catch {
@@ -244,12 +260,21 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
 
       {/* 存储面板 */}
       <StorageMeter />
+      <SavePathSettings />
 
       {/* 底部:中枢信息 */}
       <div className="flex items-center gap-1 border-t border-line px-3 py-2.5">
-        <span className="num min-w-0 flex-1 truncate text-[11.5px] text-muted" title={`http://${location.host}`}>
+        <button
+          type="button"
+          onClick={() => setInviteOpen(true)}
+          className="num min-w-0 flex-1 truncate rounded px-1 py-0.5 text-left text-[11.5px] text-muted transition-colors hover:bg-surface-2 hover:text-ink"
+          title="显示邀请二维码"
+        >
           {location.host}
-        </span>
+        </button>
+        <IconButton label="邀请二维码" className="h-7 w-7" onClick={() => setInviteOpen(true)}>
+          <QrCode size={14} />
+        </IconButton>
         <IconButton label="复制中枢地址" className="h-7 w-7" onClick={() => void copyHubAddress()}>
           {copied ? <Check size={14} className="text-primary" weight="bold" /> : <Copy size={14} />}
         </IconButton>
@@ -261,11 +286,39 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
         </IconButton>
       </div>
-      {hubVersion && !mobile && (
-        <div className="px-3.5 pb-2 text-right">
-          <span className="num text-[10.5px] text-muted/70">hub v{hubVersion}</span>
+      {(hubVersion || inShell) && !mobile && (
+        <div className="flex items-center justify-end gap-2 px-3.5 pb-2">
+          {inShell && <span className="text-[10.5px] text-muted/70">托盘壳</span>}
+          {hubVersion && <span className="num text-[10.5px] text-muted/70">hub v{hubVersion}</span>}
         </div>
       )}
+
+      {/* 邀请对话框 */}
+      <Dialog open={inviteOpen} onClose={() => setInviteOpen(false)} title="邀请其他设备">
+        <p className="text-[13px] leading-relaxed text-muted">
+          手机扫码,或把地址发到局域网内的其他电脑浏览器。
+        </p>
+        <div
+          className="mx-auto mt-4 w-fit rounded-[12px] border border-line bg-bg p-3 text-ink"
+          aria-hidden="true"
+          dangerouslySetInnerHTML={{ __html: inviteQr }}
+        />
+        <p className="num mt-3 break-all text-center text-[12px] text-muted">{hubUrl}</p>
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            onClick={() => void copyHubAddress()}
+            className="h-9 rounded-[10px] px-3.5 text-[13px] font-medium text-ink hover:bg-surface-2"
+          >
+            {copied ? '已复制' : '复制地址'}
+          </button>
+          <button
+            onClick={() => setInviteOpen(false)}
+            className="h-9 rounded-[10px] bg-primary px-3.5 text-[13px] font-medium text-on-primary hover:opacity-90"
+          >
+            完成
+          </button>
+        </div>
+      </Dialog>
 
       {/* 重命名对话框 */}
       <Dialog open={renaming} onClose={() => setRenaming(false)} title="重命名这台设备">

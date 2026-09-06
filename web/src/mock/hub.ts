@@ -25,21 +25,41 @@ interface MockFile {
   name: string
   size: number
   image: boolean
+  device_id: string
+  uploaded_at: string
+  expires_at: string
 }
 
 const FILES: Record<string, MockFile> = {}
 
-function file(name: string, size: number, image = false): MockFile {
+function file(
+  name: string,
+  size: number,
+  opts: { image?: boolean; device_id?: string; hours_ago?: number } = {},
+): MockFile {
   const id = `f-${Object.keys(FILES).length + 1}`
-  const ref: MockFile = { file_id: id, name, size, image }
+  const uploaded = hoursAgo(opts.hours_ago ?? 5)
+  const ref: MockFile = {
+    file_id: id,
+    name,
+    size,
+    image: opts.image ?? false,
+    device_id: opts.device_id ?? 'dev-desk',
+    uploaded_at: uploaded,
+    expires_at: daysAgo(-5),
+  }
   FILES[id] = ref
   return ref
 }
 
 // 预置的演示数据(含大厅广播)
-const fZip = file('品牌设计-定稿.zip', 1_976_442_368)
-const fShot = file('IMG_20260905_2213.jpg', 3_918_442, true)
-const fTrip = file('旅行照片-精选.zip', 825_417_113)
+const fZip = file('品牌设计-定稿.zip', 1_976_442_368, { device_id: 'dev-desk', hours_ago: 5.1 })
+const fShot = file('IMG_20260905_2213.jpg', 3_918_442, {
+  image: true,
+  device_id: 'dev-phone',
+  hours_ago: 14.3,
+})
+const fTrip = file('旅行照片-精选.zip', 825_417_113, { device_id: 'dev-laptop', hours_ago: 7.5 })
 
 const now = () => new Date().toISOString()
 
@@ -279,7 +299,7 @@ async function handleApi(
 
     if (upMatch[2] && method === 'POST') {
       // complete:落一条文件消息并广播,响应携带消息本体
-      const fid = file(up.name, up.size || 1_048_576)
+      const fid = file(up.name, up.size || 1_048_576, { device_id: SELF_ID, hours_ago: 0 })
       const m: Message = {
         message_id: `m-${msgCounter++}`,
         conversation_id: up.conv,
@@ -304,6 +324,21 @@ async function handleApi(
     }
   }
 
+  if (path === '/api/files' && method === 'GET') {
+    const files = Object.values(FILES)
+      .slice()
+      .sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at))
+      .map((f) => ({
+        file_id: f.file_id,
+        name: f.name,
+        size: f.size,
+        device_id: f.device_id,
+        uploaded_at: f.uploaded_at,
+        expires_at: f.expires_at,
+      }))
+    return json({ files })
+  }
+
   const fileMatch = path.match(/^\/api\/files\/([^/]+)(\/meta)?$/)
   if (fileMatch) {
     const id = decodeURIComponent(fileMatch[1]!)
@@ -314,8 +349,8 @@ async function handleApi(
         file_id: f.file_id,
         name: f.name,
         size: f.size,
-        uploaded_at: hoursAgo(5),
-        expires_at: daysAgo(-5),
+        uploaded_at: f.uploaded_at,
+        expires_at: f.expires_at,
       })
     }
     if (method === 'DELETE') {

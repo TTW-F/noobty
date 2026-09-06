@@ -7,6 +7,7 @@ pub mod devices;
 pub mod error;
 pub mod files;
 pub mod relays;
+pub mod thumbs;
 pub mod uploads;
 pub mod ws;
 

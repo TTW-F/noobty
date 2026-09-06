@@ -155,6 +155,12 @@ grep -q '"kind":"file"' "$TMP/ws.log" && pass "file message pushed" || fail "fil
 echo "== storage accounting"
 check "used equals file size (no zombie upload row)" "262144" "$(curl -s "$BASE/api/storage" | jid used_bytes)"
 
+echo "== file warehouse list"
+LIST_N=$(curl -s "$BASE/api/files?limit=10" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);console.log((o.files||[]).length)})")
+check "list includes uploaded file" "1" "$LIST_N"
+LIST_ID=$(curl -s "$BASE/api/files?limit=10" | jid files.0.file_id)
+check "list file_id matches" "$FID" "$LIST_ID"
+
 echo "== upload cancellation (tus termination)"
 UPC=$(curl -s -X POST "$BASE/api/uploads" -H "X-Noobty-Device: $A" -H 'content-type: application/json' -d '{"name":"cancel-me.bin","size":1000}' | jid upload_id)
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/api/uploads/$UPC" -H "X-Noobty-Device: $A")

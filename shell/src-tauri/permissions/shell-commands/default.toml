@@ -2,4 +2,14 @@
 [[permission]]
 identifier = "allow-shell-commands"
 description = "允许页面调用壳的命令:中枢配置、自动接收开关、文件自动接收下载"
-commands.allow = ["hub_url", "set_hub_url", "auto_accept", "download_to"]
+commands.allow = [
+  "hub_url",
+  "set_hub_url",
+  "auto_accept",
+  "download_dir",
+  "set_download_dir",
+  "pick_download_dir",
+  "download_to",
+  "notify",
+  "open_hub",
+]

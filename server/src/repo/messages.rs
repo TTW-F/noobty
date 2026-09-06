@@ -68,26 +68,55 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
 }
 
 fn hydrate_file_groups(c: &rusqlite::Connection, messages: &mut [Message]) -> rusqlite::Result<()> {
+    let group_ids: Vec<String> = messages
+        .iter()
+        .filter(|m| matches!(m.payload, MessagePayload::FileGroup(_)))
+        .map(|m| m.id.clone())
+        .collect();
+    if group_ids.is_empty() {
+        return Ok(());
+    }
+
+    // One IN query for the whole page instead of prepare-per-group (N+1).
+    let placeholders = std::iter::repeat_n("?", group_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT mf.message_id, f.id, f.name, f.size
+         FROM message_files mf
+         JOIN files f ON f.id = mf.file_id
+         WHERE mf.message_id IN ({placeholders})
+         ORDER BY mf.message_id ASC, mf.position ASC"
+    );
+    let mut stmt = c.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = group_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let mut by_message: std::collections::HashMap<String, Vec<StoredFile>> =
+        std::collections::HashMap::with_capacity(group_ids.len());
+    {
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StoredFile {
+                    id: r.get(1)?,
+                    name: r.get(2)?,
+                    size: r.get::<_, i64>(3)? as u64,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (mid, file) = row?;
+            by_message.entry(mid).or_default().push(file);
+        }
+    }
+
     for m in messages.iter_mut() {
         if !matches!(m.payload, MessagePayload::FileGroup(_)) {
             continue;
         }
-        let mut stmt = c.prepare(
-            "SELECT f.id, f.name, f.size
-             FROM message_files mf
-             JOIN files f ON f.id = mf.file_id
-             WHERE mf.message_id = ?1
-             ORDER BY mf.position ASC",
-        )?;
-        let files = stmt
-            .query_map(params![m.id], |r| {
-                Ok(StoredFile {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    size: r.get::<_, i64>(2)? as u64,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        let files = by_message.remove(&m.id).unwrap_or_default();
         m.payload = MessagePayload::FileGroup(files);
     }
     Ok(())
@@ -396,21 +425,43 @@ pub async fn delete(db: &Db, message_id: String) -> Result<Option<RemovedMessage
 }
 
 /// True when this file_id is already attached to any message (single or group).
+#[allow(dead_code)] // single-id convenience; batch path uses `files_already_messaged`
 pub async fn file_already_messaged(db: &Db, file_id: String) -> Result<bool> {
+    let taken = files_already_messaged(db, vec![file_id]).await?;
+    Ok(!taken.is_empty())
+}
+
+/// File ids (from `ids`) that are already attached to any message. One round-trip.
+pub async fn files_already_messaged(db: &Db, ids: Vec<String>) -> Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
     db.exec(move |c| {
-        let in_single: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE file_id = ?1)",
-            params![file_id],
-            |r| r.get(0),
-        )?;
-        if in_single {
-            return Ok(true);
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut taken = std::collections::HashSet::new();
+        {
+            let sql = format!("SELECT file_id FROM messages WHERE file_id IN ({placeholders})");
+            let mut stmt = c.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                taken.insert(row?);
+            }
         }
-        c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM message_files WHERE file_id = ?1)",
-            params![file_id],
-            |r| r.get(0),
-        )
+        {
+            let sql = format!("SELECT file_id FROM message_files WHERE file_id IN ({placeholders})");
+            let mut stmt = c.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::types::ToSql> =
+                ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+            for row in rows {
+                taken.insert(row?);
+            }
+        }
+        Ok(taken)
     })
     .await
 }

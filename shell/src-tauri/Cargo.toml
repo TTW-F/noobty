@@ -22,6 +22,7 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 futures-util = "0.3"
 tokio = { version = "1", features = ["fs", "io-util"] }
 dirs = "6"
+rfd = "0.15"
 
 [profile.release]
 strip = true

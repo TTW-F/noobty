@@ -99,7 +99,9 @@ where
     st.blobs.ensure_staging(&meta.id).await?;
     let mut live = st.relays.attach_sender(relay_id).await?;
 
-    let (mut file, _len) = st.blobs.open_for_append(&meta.id).await?;
+    let (file, _len) = st.blobs.open_for_append(&meta.id).await?;
+    // Match upload path: coalesce network chunks into 256 KiB disk writes.
+    let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
     let mut written: u64 = 0;
 
     while let Some(item) = futures_util::StreamExt::next(&mut body).await {

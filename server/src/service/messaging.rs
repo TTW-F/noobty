@@ -74,19 +74,27 @@ pub async fn post_file_group(
     }
     let peer = conversation_peer(st, conversation_id).await?;
 
+    let entries = repo::files::get_many(&st.db, file_ids.clone()).await?;
+    if entries.len() != file_ids.len() {
+        let found: std::collections::HashSet<_> = entries.iter().map(|e| e.id.as_str()).collect();
+        let missing = file_ids
+            .iter()
+            .find(|id| !found.contains(id.as_str()))
+            .cloned()
+            .unwrap_or_else(|| "unknown".into());
+        return Err(Error::NotFound(format!("file {missing} not found")));
+    }
+    let taken = repo::messages::files_already_messaged(&st.db, file_ids.clone()).await?;
     let mut files = Vec::with_capacity(file_ids.len());
-    for id in &file_ids {
-        let entry = repo::files::get(&st.db, id.clone())
-            .await?
-            .ok_or_else(|| Error::NotFound(format!("file {id} not found")))?;
+    for entry in entries {
         if entry.device_id != from_device_id {
             return Err(Error::Forbidden(
                 "only the uploader may attach a file to a group message".into(),
             ));
         }
-        if repo::messages::file_already_messaged(&st.db, id.clone()).await? {
+        if taken.contains(&entry.id) {
             return Err(Error::Conflict {
-                message: format!("file {id} is already attached to a message"),
+                message: format!("file {} is already attached to a message", entry.id),
                 current_offset: None,
                 fallback: None,
             });

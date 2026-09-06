@@ -1,5 +1,5 @@
-// 会话视图:头部、连接横幅、消息流(分组 + 吸附日期 + 分页)、拖拽发送、发送器
-import { useEffect, useLayoutEffect, useRef, useState, type DragEvent } from 'react'
+// 会话视图:头部、连接横幅、消息流(虚拟列表 + 分组 + 吸附日期 + 分页)、拖拽发送、发送器
+import { useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import {
   ArrowDown,
   ArrowLeft,
@@ -8,6 +8,8 @@ import {
   Plugs,
   PlugsConnected,
 } from '@phosphor-icons/react'
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
+import { useShallow } from 'zustand/react/shallow'
 import { useHub } from '../store/hub'
 import { Button, EmptyState, IconButton, PresenceDot, Skeleton } from './ui'
 import { MessageRow } from './messages'
@@ -17,13 +19,49 @@ import { filesFromDataTransfer } from '../lib/pick'
 import type { ConversationId, Message } from '../lib/types'
 
 const GROUP_WINDOW_MS = 3 * 60_000
-/** 距底超过该值即视为"离底":显示回到底部按钮并累计新消息 */
-const OFF_BOTTOM_PX = 120
-const STICK_THRESHOLD_PX = 120
+/** Virtuoso prepend 基准:加载更早时向下递减,避免重排已渲染项 */
+const VIRT_START = 100_000
+
+type ListRow =
+  | { kind: 'day'; key: string; day: string }
+  | { kind: 'msg'; key: string; message: Message; grouped: boolean; senderName: string | undefined }
+
+function buildRows(messages: Message[], names: Record<string, string>): ListRow[] {
+  const rows: ListRow[] = []
+  let prev: Message | null = null
+  let prevDay = ''
+  for (const m of messages) {
+    const day = formatDayLabel(m.created_at)
+    if (day !== prevDay) {
+      rows.push({ kind: 'day', key: `d-${m.message_id}`, day })
+      prevDay = day
+      prev = null
+    }
+    const grouped =
+      prev !== null &&
+      prev.from_device_id === m.from_device_id &&
+      new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() < GROUP_WINDOW_MS
+    rows.push({
+      kind: 'msg',
+      key: m.message_id,
+      message: m,
+      grouped,
+      senderName: names[m.from_device_id],
+    })
+    prev = m
+  }
+  return rows
+}
 
 // ---------- 消息流 ----------
 
-function MessageList({ conv, convName, isLobby, lobbyM2, emptyIcon }: {
+function MessageList({
+  conv,
+  convName,
+  isLobby,
+  lobbyM2,
+  emptyIcon,
+}: {
   conv: ConversationId
   convName: string
   isLobby: boolean
@@ -31,89 +69,78 @@ function MessageList({ conv, convName, isLobby, lobbyM2, emptyIcon }: {
   emptyIcon: React.ReactNode
 }) {
   const me = useHub((s) => s.me)
-  const devices = useHub((s) => s.devices)
+  // 只取名字表:presence 上下线不触发整表 rebuild(客户端 CPU)
+  const deviceNames = useHub(
+    useShallow((s) => {
+      const names: Record<string, string> = {}
+      for (const d of s.devices) names[d.device_id] = d.name
+      return names
+    }),
+  )
   const messages = useHub((s) => s.messages[conv])
   const historyStatus = useHub((s) => s.historyStatus[conv])
   const hasMore = useHub((s) => s.hasMore[conv] ?? false)
   const loadingMore = useHub((s) => s.loadingMore[conv] ?? false)
   const loadOlder = useHub((s) => s.loadOlder)
 
-  const listRef = useRef<HTMLDivElement>(null)
+  const virtuosoRef = useRef<VirtuosoHandle>(null)
   const stickToBottom = useRef(true)
-  const lastLenRef = useRef(0)
-  const anchorRef = useRef<{ height: number; top: number } | null>(null)
+  const prependPending = useRef(false)
+  const prevRowLen = useRef(0)
+  const [firstItemIndex, setFirstItemIndex] = useState(VIRT_START)
   const [pending, setPending] = useState(0)
   const [showJump, setShowJump] = useState(false)
 
-  // 切换会话:直接到底(刻意只依赖 conv;messages 长度由 followOrCount 单独跟踪)
+  const rows = useMemo(() => buildRows(messages ?? [], deviceNames), [messages, deviceNames])
+
   useEffect(
-    function jumpToBottom() {
-      const el = listRef.current
-      if (!el) return
-      el.scrollTop = el.scrollHeight
+    function resetOnConv() {
+      setFirstItemIndex(VIRT_START)
+      prevRowLen.current = 0
+      prependPending.current = false
       stickToBottom.current = true
-      lastLenRef.current = messages?.length ?? 0
       setPending(0)
       setShowJump(false)
     },
     [conv],
   )
 
-  // 新消息:贴底则跟随,否则累计到"回到底部"按钮
   useEffect(
-    function followOrCount() {
-      const el = listRef.current
-      if (!el) return
-      const len = messages?.length ?? 0
-      const delta = len - lastLenRef.current
-      lastLenRef.current = len
-      if (delta <= 0) return
-      if (stickToBottom.current) {
-        el.scrollTop = el.scrollHeight
-      } else {
+    function trackLength() {
+      const len = rows.length
+      const prev = prevRowLen.current
+      const delta = len - prev
+      prevRowLen.current = len
+      if (delta <= 0 || prev === 0) return
+      if (prependPending.current) {
+        setFirstItemIndex((v) => v - delta)
+        prependPending.current = false
+        return
+      }
+      if (!stickToBottom.current) {
         setPending((p) => p + delta)
       }
     },
-    [messages],
+    [rows.length],
   )
-
-  // 加载更早后恢复滚动位置
-  useLayoutEffect(
-    function restoreAnchor() {
-      const anchor = anchorRef.current
-      const el = listRef.current
-      if (!anchor || !el) return
-      anchorRef.current = null
-      el.scrollTop = el.scrollHeight - anchor.height + anchor.top
-    },
-    [messages],
-  )
-
-  const onScroll = () => {
-    const el = listRef.current
-    if (!el) return
-    const distance = el.scrollHeight - el.scrollTop - el.clientHeight
-    stickToBottom.current = distance < STICK_THRESHOLD_PX
-    setShowJump(distance > OFF_BOTTOM_PX)
-    if (stickToBottom.current) setPending(0)
-  }
 
   const jumpToLatest = () => {
-    const el = listRef.current
-    if (!el) return
     const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches
-    el.scrollTo({ top: el.scrollHeight, behavior: reduce ? 'auto' : 'smooth' })
+    virtuosoRef.current?.scrollToIndex({
+      index: 'LAST',
+      align: 'end',
+      behavior: reduce ? 'auto' : 'smooth',
+    })
     stickToBottom.current = true
     setPending(0)
+    setShowJump(false)
   }
 
   const requestOlder = () => {
-    const el = listRef.current
-    if (el) anchorRef.current = { height: el.scrollHeight, top: el.scrollTop }
+    prependPending.current = true
     loadOlder(conv)
   }
 
-  // 旧中枢可能仍拒绝大厅:探测失败时给解释页,不给可交互假象
   if (isLobby && lobbyM2) {
     return (
       <EmptyState
@@ -153,57 +180,69 @@ function MessageList({ conv, convName, isLobby, lobbyM2, emptyIcon }: {
     )
   }
 
-  const rows: React.ReactNode[] = []
-  let prev: Message | null = null
-  let prevDay = ''
-  for (const m of messages) {
-    const day = formatDayLabel(m.created_at)
-    if (day !== prevDay) {
-      rows.push(
-        <div key={`d-${m.message_id}`} className="sticky top-0 z-10 -mx-2 bg-bg/85 px-2 py-1.5 backdrop-blur-sm">
-          <div className="flex items-center gap-3">
-            <span className="h-px flex-1 bg-line" />
-            <span className="text-[11.5px] text-muted">{day}</span>
-            <span className="h-px flex-1 bg-line" />
-          </div>
-        </div>,
-      )
-      prevDay = day
-      prev = null
-    }
-    const mine = m.from_device_id === me?.device_id
-    const grouped =
-      prev !== null &&
-      prev.from_device_id === m.from_device_id &&
-      new Date(m.created_at).getTime() - new Date(prev.created_at).getTime() < GROUP_WINDOW_MS
-    const sender = devices.find((d) => d.device_id === m.from_device_id)
-    rows.push(<MessageRow key={m.message_id} message={m} mine={mine} grouped={grouped} sender={sender} />)
-    prev = m
-  }
-
   return (
     <div className="relative min-h-0 flex-1">
-      <div
-        ref={listRef}
-        onScroll={onScroll}
+      <Virtuoso
+        ref={virtuosoRef}
+        data={rows}
+        firstItemIndex={firstItemIndex}
+        initialTopMostItemIndex={rows.length - 1}
+        increaseViewportBy={{ top: 480, bottom: 240 }}
+        followOutput={() => (stickToBottom.current ? 'smooth' : false)}
+        atBottomStateChange={(atBottom) => {
+          stickToBottom.current = atBottom
+          setShowJump(!atBottom)
+          if (atBottom) setPending(0)
+        }}
+        atBottomThreshold={120}
+        className="h-full px-3 sm:px-4"
         role="log"
         aria-live="polite"
-        className="h-full overflow-y-auto px-3 py-4 sm:px-4"
-      >
-        {hasMore && (
-          <div className="mb-3 flex justify-center">
-            <Button
-              variant="ghost"
-              loading={loadingMore}
-              onClick={requestOlder}
-              className="h-8 text-[12.5px] text-muted"
-            >
-              查看更早的消息
-            </Button>
-          </div>
-        )}
-        <div className="mx-auto flex max-w-[720px] flex-col gap-1.5">{rows}</div>
-      </div>
+        components={{
+          Header: () =>
+            hasMore ? (
+              <div className="mb-3 flex justify-center pt-4">
+                <Button
+                  variant="ghost"
+                  loading={loadingMore}
+                  onClick={requestOlder}
+                  className="h-8 text-[12.5px] text-muted"
+                >
+                  查看更早的消息
+                </Button>
+              </div>
+            ) : (
+              <div className="h-4" />
+            ),
+          Footer: () => <div className="h-4" />,
+        }}
+        itemContent={(_index, row) => {
+          if (row.kind === 'day') {
+            return (
+              <div className="mx-auto max-w-[720px] py-1.5">
+                <div className="sticky top-0 z-10 bg-bg/85 px-2 py-1.5 backdrop-blur-sm">
+                  <div className="flex items-center gap-3">
+                    <span className="h-px flex-1 bg-line" />
+                    <span className="text-[11.5px] text-muted">{row.day}</span>
+                    <span className="h-px flex-1 bg-line" />
+                  </div>
+                </div>
+              </div>
+            )
+          }
+          const mine = row.message.from_device_id === me?.device_id
+          return (
+            <div className="mx-auto max-w-[720px] py-[3px]">
+              <MessageRow
+                message={row.message}
+                mine={mine}
+                grouped={row.grouped}
+                senderName={row.senderName}
+              />
+            </div>
+          )
+        }}
+      />
 
       {showJump && (
         <button
@@ -286,7 +325,6 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {/* 头部 */}
       <header className="flex h-14 shrink-0 items-center gap-2 border-b border-line bg-bg px-2.5 sm:px-4">
         {mobile && (
           <IconButton label="返回会话列表" onClick={onBack} className="-ml-1">
@@ -326,7 +364,6 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
         </span>
       </header>
 
-      {/* 连接状态横幅 */}
       {status !== 'online' && (
         <div
           aria-live="assertive"
@@ -363,10 +400,8 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
         lobbyM2={isLobby && lobbySupported === false}
         emptyIcon={<Plugs size={26} />}
       />
-      {/* 探测未出结果时也先禁用:杜绝把消息误发进大厅的窗口期 */}
       <Composer conv={activeConv} disabled={isLobby && lobbySupported !== true} />
 
-      {/* 拖拽遮罩 */}
       {dragging && (
         <div className="anim-fade pointer-events-none absolute inset-0 z-30 m-3 flex items-center justify-center rounded-[14px] border-2 border-dashed border-primary bg-primary-soft/85 backdrop-blur-[2px]">
           <div className="flex items-center gap-2 rounded-full bg-bg px-4 py-2 text-[14px] font-medium shadow">

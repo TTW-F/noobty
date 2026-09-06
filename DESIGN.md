@@ -74,7 +74,7 @@
 | TextBubble | 己方 `primary` 白字(桌面)/`primary-soft`(暗色)…统一:己方 primary、对方 surface;hover 浮出 复制/删除 |
 | FileCard | 图标按类型、名称截断、大小(等宽)、状态行;状态机:上传中%(进度条+速度)→ 已寄存·等待取件 → 已取件;下载中%(速度)→ 完成(另存);失败(重试);已过期(warning);删除需确认 |
 | FileGroupCard | 多文件行堆叠 + 聚合进度;逐行独立状态 |
-| ImageCard | `<img src="/api/files/{id}">` 直连;载入前占位(比例保留),失败回退文件卡 |
+| 文件仓库 | 侧栏「文件」视图;数据源 `GET /api/files`(中枢寄存清单);搜索/筛选/按日分组;取件·另存·删除;寄存空间表 |
 | Composer | 自增高输入;附件按钮;粘贴文件即加入;Enter 发送 / Shift+Enter 换行;多文件队列条(逐个进度) |
 | DropOverlay | 拖拽悬停全窗虚线框:"松开发送到〈会话〉" |
 | StorageMeter | 已用/上限(等宽)、比例条;>80% 变 warning;注明保留期 |

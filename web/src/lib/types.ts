@@ -40,6 +40,16 @@ export interface StorageInfo {
   retention_days: number
 }
 
+/** `GET /api/files` 仓库条目(中枢寄存清单) */
+export interface StoredFileItem {
+  file_id: string
+  name: string
+  size: number
+  device_id: string
+  uploaded_at: string
+  expires_at: string
+}
+
 export interface HubVersion {
   ok: boolean
   name: string

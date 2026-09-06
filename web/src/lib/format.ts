@@ -63,3 +63,15 @@ export function formatRelative(iso: string): string {
   if (diff < 172800_000) return '昨天'
   return formatDayLabel(iso)
 }
+
+/** 距过期的剩余时间;已过期返回「已过期」 */
+export function formatExpiresIn(iso: string): string {
+  const t = new Date(iso).getTime()
+  if (Number.isNaN(t)) return ''
+  const ms = t - Date.now()
+  if (ms <= 0) return '已过期'
+  if (ms < 3600_000) return `${Math.max(1, Math.ceil(ms / 60_000))} 分钟后过期`
+  if (ms < 86400_000) return `${Math.ceil(ms / 3600_000)} 小时后过期`
+  const days = Math.ceil(ms / 86400_000)
+  return `${days} 天后过期`
+}

@@ -26,7 +26,7 @@ Sending a big archive over WeChat is slow and capped by size limits. On a LAN yo
 - [x] M0 — monorepo skeleton, hub server skeleton, deployment plan
 - [x] M1 (backend) — hub server: store-and-forward, private chats, text/file messages, resumable (tus-style) uploads, HTTP-Range downloads, history with catch-up cursors, WebSocket presence & push, retention/quota sweeper. Web UI in progress.
 - [x] M2 — lobby, streaming relay (tee), multi-file/folder `file_group` batches
-- [ ] M3 — Windows tray shell (notifications, auto-accept)
+- [x] M3 — Windows tray shell (notifications, auto-accept to `Downloads\Noobty`, HTML5 drag-send). See [shell/](shell/)
 - [ ] M4 — auth + optional WAN exposure; toolbox features
 
 ## Development
@@ -40,6 +40,9 @@ cd web && npm ci && npm run build
 # hub server (serves the web UI, API and WebSocket)
 cd server && cargo run
 # → http://localhost:7317
+
+# optional Windows tray shell (embeds the hub URL)
+cd shell && npm ci && npm run dev
 ```
 
 Configuration: copy [config.example.toml](config.example.toml) to `config.toml` and edit.

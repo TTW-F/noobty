@@ -1,8 +1,9 @@
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
+use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 
 use crate::api::acting_device;
@@ -11,9 +12,44 @@ use crate::service;
 use crate::state::SharedState;
 use crate::wire;
 
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    pub limit: Option<u32>,
+    /// Cursor: return files strictly older than this file_id (newest-first paging).
+    pub before: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DownloadQuery {
+    /// `1` / `true` → `Content-Disposition: inline` + image Content-Type for `<img>`.
+    pub inline: Option<String>,
+}
+
+/// File warehouse: every committed blob on the hub (newest first).
+pub async fn list(
+    State(st): State<SharedState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<wire::StoredFileList>> {
+    let entries = service::transfers::list_files(&st, q.limit, q.before).await?;
+    Ok(Json(wire::StoredFileList {
+        files: entries
+            .into_iter()
+            .map(|e| wire::StoredFileListItem {
+                file_id: e.id,
+                name: e.name,
+                size: e.size,
+                device_id: e.device_id,
+                uploaded_at: wire::ms_to_rfc3339(e.uploaded_ms),
+                expires_at: wire::ms_to_rfc3339(e.expires_ms),
+            })
+            .collect(),
+    }))
+}
+
 pub async fn download(
     State(st): State<SharedState>,
     Path(file_id): Path<String>,
+    Query(q): Query<DownloadQuery>,
     headers: HeaderMap,
 ) -> Result<Response> {
     let entry = service::transfers::file_entry(&st, &file_id).await?;
@@ -22,18 +58,31 @@ pub async fn download(
         .map_err(|_| Error::NotFound(format!("content of file {file_id} is missing")))?;
     let size = file.metadata().await?.len();
 
-    let disposition = content_disposition(&entry.name);
+    let inline = q
+        .inline
+        .as_deref()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let disposition = if inline {
+        content_disposition_inline(&entry.name)
+    } else {
+        content_disposition(&entry.name)
+    };
+    let content_type = if inline {
+        image_content_type(&entry.name).unwrap_or("application/octet-stream")
+    } else {
+        "application/octet-stream"
+    };
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     match parse_single_range(range, size)? {
         Some((start, end)) => {
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             file.seek(std::io::SeekFrom::Start(start)).await?;
             let len = end - start + 1;
-            // 64 KiB stream chunks: fewer syscalls per gigabyte than the 8 KiB default.
-            let body = Body::from_stream(ReaderStream::with_capacity(file.take(len), 64 * 1024));
+            // 256 KiB stream chunks: align with upload/relay BufWriter; fewer syscalls per GiB.
+            let body = Body::from_stream(ReaderStream::with_capacity(file.take(len), 256 * 1024));
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_TYPE, content_type)
                 .header(header::CONTENT_LENGTH, len)
                 .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{size}"))
                 .header(header::ACCEPT_RANGES, "bytes")
@@ -42,10 +91,10 @@ pub async fn download(
                 .map_err(Error::from)
         }
         None => {
-            let body = Body::from_stream(ReaderStream::with_capacity(file, 64 * 1024));
+            let body = Body::from_stream(ReaderStream::with_capacity(file, 256 * 1024));
             Response::builder()
                 .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CONTENT_TYPE, content_type)
                 .header(header::CONTENT_LENGTH, size)
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header(header::CONTENT_DISPOSITION, disposition)
@@ -134,6 +183,14 @@ fn parse_single_range(spec: Option<&str>, size: u64) -> Result<Option<(u64, u64)
 /// Both filename forms: quoted ASCII fallback + RFC 5987 UTF-8 encoding,
 /// so non-ASCII names (压缩包.zip) survive every browser.
 pub fn content_disposition(name: &str) -> String {
+    disposition_with_type("attachment", name)
+}
+
+fn content_disposition_inline(name: &str) -> String {
+    disposition_with_type("inline", name)
+}
+
+fn disposition_with_type(kind: &str, name: &str) -> String {
     let fallback: String = name
         .chars()
         .map(|c| {
@@ -159,7 +216,22 @@ pub fn content_disposition(name: &str) -> String {
             }
         })
         .collect();
-    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+    format!("{kind}; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
+}
+
+fn image_content_type(name: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => return None,
+    })
 }
 
 impl From<axum::http::Error> for Error {

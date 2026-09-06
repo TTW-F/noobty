@@ -1,5 +1,6 @@
 // 文件发送:对端在线优先直转(边传边收+落盘),否则/失败回落 tus 寄存上传。
 import { api, ApiError, type CompleteResp } from './api'
+import { openSaveSink, pumpReaderToSink } from './saveStream'
 import { uploadFile, type UploadHandle, type UploadProgress } from './upload'
 
 export type { UploadProgress, UploadHandle }
@@ -179,7 +180,7 @@ function putRelayWithProgress(
   })
 }
 
-/** 接收方实时拉取直转流(与 PUT tee 并行);失败时调用方改走普通取件。 */
+/** 接收方实时拉取直转流(与 PUT tee 并行);失败时调用方改走普通取件。优先磁盘流式落盘。 */
 export function receiveRelay(
   relayId: string,
   deviceId: string,
@@ -187,41 +188,24 @@ export function receiveRelay(
   onProgress: (p: { receivedBytes: number; totalBytes: number; speed: number }) => void,
 ): { promise: Promise<void>; cancel: () => void } {
   const controller = new AbortController()
-  const parts: BlobPart[] = []
-  let received = 0
-  const startedAt = Date.now()
 
   const promise = (async () => {
-    const res = await fetch(api.relayUrl(relayId), {
-      headers: { 'X-Noobty-Device': deviceId },
-      signal: controller.signal,
-    })
-    if (!res.ok) throw new ApiError(res.status, `直转接收失败(${res.status})`)
-    const reader = res.body?.getReader()
-    if (!reader) throw new Error('直转响应无正文')
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value) {
-        parts.push(value.slice().buffer as ArrayBuffer)
-        received += value.byteLength
-        const elapsed = Math.max(0.25, (Date.now() - startedAt) / 1000)
-        onProgress({
-          receivedBytes: received,
-          totalBytes: file.size,
-          speed: received / elapsed,
-        })
-      }
+    const sink = await openSaveSink(file.name, file.size)
+    const state = { received: 0, startedAt: Date.now(), totalBytes: file.size }
+    try {
+      const res = await fetch(api.relayUrl(relayId), {
+        headers: { 'X-Noobty-Device': deviceId },
+        signal: controller.signal,
+      })
+      if (!res.ok) throw new ApiError(res.status, `直转接收失败(${res.status})`)
+      const reader = res.body?.getReader()
+      if (!reader) throw new Error('直转响应无正文')
+      await pumpReaderToSink(reader, sink, state, onProgress)
+      await sink.finish()
+    } catch (err) {
+      await sink.abort()
+      throw err
     }
-    const blob = new Blob(parts)
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = file.name
-    document.body.append(a)
-    a.click()
-    a.remove()
-    setTimeout(() => URL.revokeObjectURL(url), 30_000)
   })()
 
   return {

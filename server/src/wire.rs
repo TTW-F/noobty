@@ -260,6 +260,22 @@ pub struct FullFileMeta {
     pub expires_at: String,
 }
 
+/// One row in `GET /api/files` (file warehouse source of truth).
+#[derive(Debug, Serialize)]
+pub struct StoredFileListItem {
+    pub file_id: String,
+    pub name: String,
+    pub size: u64,
+    pub device_id: String,
+    pub uploaded_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StoredFileList {
+    pub files: Vec<StoredFileListItem>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct StorageInfo {
     pub used_bytes: u64,
