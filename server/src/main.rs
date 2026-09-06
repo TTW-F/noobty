@@ -19,6 +19,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
+use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -61,7 +62,9 @@ async fn main() {
         .route("/api/uploads", post(api::uploads::create))
         .route(
             "/api/uploads/{upload_id}",
-            get(api::uploads::info).put(api::uploads::put_chunk),
+            get(api::uploads::info)
+                .put(api::uploads::put_chunk)
+                .delete(api::uploads::cancel),
         )
         .route(
             "/api/uploads/{upload_id}/complete",
@@ -75,6 +78,8 @@ async fn main() {
         .route("/api/storage", get(api::storage_info))
         .fallback_service(ServeDir::new(&state.cfg.web_dir))
         .layer(TraceLayer::new_for_http())
+        // 托盘壳首启页(tauri.localhost)与跨源工具需要探测中枢;v1 局域网信任,放开 CORS
+        .layer(CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(state.cfg.chunk_size))
         .with_state(state.clone());
 

@@ -70,7 +70,7 @@ pub async fn complete(
 ) -> Result<(StatusCode, Json<wire::CompleteResp>)> {
     let device = acting_device(&st, &headers).await?;
     let session = service::transfers::session_owned(&st, &upload_id, &device.id).await?;
-    let conversation = opts.map(|Json(o)| o.conversation_id);
+    let conversation = opts.and_then(|Json(o)| o.conversation_id);
     let (entry, message) = service::transfers::complete_upload(&st, &session, conversation).await?;
     Ok((
         StatusCode::CREATED,
@@ -79,6 +79,19 @@ pub async fn complete(
             message: message.as_ref().map(Into::into),
         }),
     ))
+}
+
+/// Cancel an in-progress upload (tus termination): drops the session row and
+/// the staging blob, releasing the reserved quota. Owner only.
+pub async fn cancel(
+    State(st): State<SharedState>,
+    Path(upload_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
+    let device = acting_device(&st, &headers).await?;
+    let session = service::transfers::session_owned(&st, &upload_id, &device.id).await?;
+    service::transfers::cancel_upload(&st, &session).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn upload_info(st: &SharedState, session: &UploadSession, received_bytes: u64) -> wire::UploadInfo {

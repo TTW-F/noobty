@@ -96,11 +96,20 @@ pub async fn session_owned(
     Ok(session)
 }
 
-/// tus-style sequential append: `offset` must equal the server's
-/// authoritative received-byte count (else 409 with the current offset), the
-/// staging file is truncated to that offset first (healing a partial write
-/// from an aborted request), bytes stream to disk, and only after a
-/// successful `fsync` does the metadata row claim them.
+/// tus-style sequential append. Two distinct reconciliations happen here:
+///
+/// 1. **Server-internal** (DB claim vs disk reality): a request that died
+///    mid-stream leaves bytes past the claim (`actual > claim`) — they are
+///    trimmed. A power cut can lose claimed-but-uncached bytes
+///    (`actual < claim`) — the claim rewinds to what survived and the next
+///    append is answered with `409` carrying the new offset.
+/// 2. **Protocol** (client claim vs server offset, tus core): a stale
+///    client offset is always rejected with `409 {current_offset}` —
+///    clients resume from the last offset the server acknowledged.
+///
+/// Per-request fsync is deliberately skipped; durability is enforced once
+/// at completion (see `complete_upload`), which is what the寄存 guarantee
+/// needs, and costs nothing per chunk.
 pub async fn append_stream<S>(
     st: &SharedState,
     session: &UploadSession,
@@ -119,14 +128,23 @@ where
     // Drop-style unlock: every exit path below releases the per-upload lock.
     let _guard = UploadLockGuard::new(st, &session.id);
 
-    if offset != session.received_bytes {
+    let (mut file, actual) = st.blobs.open_for_append(&session.id).await?;
+    let mut authoritative = session.received_bytes;
+    if actual > authoritative {
+        use tokio::io::AsyncSeekExt;
+        file.set_len(authoritative).await?;
+        file.seek(std::io::SeekFrom::Start(authoritative)).await?;
+    } else if actual < authoritative {
+        authoritative = actual;
+        repo::uploads::set_received(&st.db, session.id.clone(), authoritative).await?;
+    }
+    if offset != authoritative {
         return Err(Error::Conflict {
             message: format!("offset {offset} does not match server offset"),
-            current_offset: Some(session.received_bytes),
+            current_offset: Some(authoritative),
         });
     }
 
-    let file = st.blobs.open_append_at(&session.id, offset).await?;
     // Buffer network-sized chunks into 256 KiB writes: far fewer syscalls
     // per gigabyte without holding the whole chunk in memory.
     let mut file = tokio::io::BufWriter::with_capacity(256 * 1024, file);
@@ -134,7 +152,7 @@ where
     let mut written: u64 = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| Error::Validation(format!("request body error: {e}")))?;
-        if offset + written + chunk.len() as u64 > session.size {
+        if authoritative + written + chunk.len() as u64 > session.size {
             return Err(Error::Validation(
                 "request body exceeds the declared file size".into(),
             ));
@@ -143,9 +161,8 @@ where
         written += chunk.len() as u64;
     }
     file.flush().await?;
-    file.get_ref().sync_all().await?;
 
-    let received = offset + written;
+    let received = authoritative + written;
     repo::uploads::set_received(&st.db, session.id.clone(), received).await?;
     Ok(received)
 }
@@ -188,6 +205,9 @@ pub async fn complete_upload(
             return Err(Error::Validation("sha256 mismatch".into()));
         }
     }
+    // The one durable-write point of the upload: what is about to be
+    // promoted must be on stable storage.
+    st.blobs.sync_staging(&session.id).await?;
 
     st.blobs.finalize(&session.id, &session.file_id).await?;
 
@@ -225,6 +245,27 @@ pub async fn complete_upload(
         }
     };
     Ok((entry, message))
+}
+
+/// Cancel an upload: session row out, staging blob removed. Quota reserved
+/// by in-flight bytes is released immediately.
+pub async fn cancel_upload(st: &SharedState, session: &UploadSession) -> Result<()> {
+    // Guard against racing an in-flight append: cancel must not pull the
+    // staging file out from under a streaming PUT.
+    if !st.blobs.try_lock_upload(&session.id) {
+        return Err(Error::Conflict {
+            message: "an append to this upload is in progress".into(),
+            current_offset: Some(session.received_bytes),
+        });
+    }
+    let _guard = UploadLockGuard::new(st, &session.id);
+
+    repo::uploads::delete_row(&st.db, session.id.clone()).await?;
+    match st.blobs.remove_staging(&session.id).await {
+        Ok(_) => {}
+        Err(e) => tracing::error!("upload {}: staging removal failed: {e:?}", session.id),
+    }
+    Ok(())
 }
 
 async fn sha256_file(path: &std::path::Path) -> Result<String> {

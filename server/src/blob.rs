@@ -68,10 +68,11 @@ impl BlobStore {
         }
     }
 
-    /// Open the staging file for append at an authoritative offset: any
-    /// bytes beyond `offset` are truncated first, healing a partial write
-    /// left behind by an aborted request, then the cursor is at the end.
-    pub async fn open_append_at(&self, upload_id: &str, offset: u64) -> Result<tokio::fs::File> {
+    /// Open the staging file positioned at its ACTUAL end, returning the
+    /// actual byte length. The actual length is the authoritative resume
+    /// point: it may trail the DB's claimed offset (bytes lost to a power
+    /// cut before flush) or exceed it (a request that died mid-stream).
+    pub async fn open_for_append(&self, upload_id: &str) -> Result<(tokio::fs::File, u64)> {
         let path = self.staging_path(upload_id);
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
@@ -79,9 +80,21 @@ impl BlobStore {
             .write(true)
             .open(&path)
             .await?;
-        file.set_len(offset).await?;
-        file.seek(std::io::SeekFrom::End(0)).await?;
-        Ok(file)
+        let len = file.metadata().await?.len();
+        file.seek(std::io::SeekFrom::Start(len)).await?;
+        Ok((file, len))
+    }
+
+    /// Flush staged bytes to stable storage. Runs once, at completion: the
+    /// file that is about to be promoted must be durable, while per-chunk
+    /// fsyncs would throttle throughput to the disk's flush latency.
+    pub async fn sync_staging(&self, upload_id: &str) -> Result<()> {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(self.staging_path(upload_id))
+            .await?;
+        file.sync_all().await?;
+        Ok(())
     }
 
     /// Promote a staging blob to its final id via atomic same-filesystem

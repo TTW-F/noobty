@@ -22,11 +22,17 @@ check() { # check <desc> <expected> <actual>
 }
 
 cd "$ROOT"
-if [ ! -x server/target/debug/noobty-server.exe ] && [ ! -x server/target/debug/noobty-server ]; then
-  cargo build --manifest-path server/Cargo.toml -q
-fi
-BIN=server/target/debug/noobty-server.exe
+# Prefer the release binary (production-parity), fall back to debug, and
+# build one only if neither exists.
+BIN=server/target/release/noobty-server.exe
+[ -x "$BIN" ] || BIN=server/target/release/noobty-server
+[ -x "$BIN" ] || BIN=server/target/debug/noobty-server.exe
 [ -x "$BIN" ] || BIN=server/target/debug/noobty-server
+if [ ! -x "$BIN" ]; then
+  cargo build --release --manifest-path server/Cargo.toml -q
+  BIN=server/target/release/noobty-server.exe
+  [ -x "$BIN" ] || BIN=server/target/release/noobty-server
+fi
 
 cat > "$TMP/config.toml" <<EOF
 port = $PORT
@@ -121,6 +127,13 @@ grep -q '"kind":"file"' "$TMP/ws.log" && pass "file message pushed" || fail "fil
 
 echo "== storage accounting"
 check "used equals file size (no zombie upload row)" "262144" "$(curl -s "$BASE/api/storage" | jid used_bytes)"
+
+echo "== upload cancellation (tus termination)"
+UPC=$(curl -s -X POST "$BASE/api/uploads" -H "X-Noobty-Device: $A" -H 'content-type: application/json' -d '{"name":"cancel-me.bin","size":1000}' | jid upload_id)
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/api/uploads/$UPC" -H "X-Noobty-Device: $A")
+check "cancel in-progress upload" "204" "$CODE"
+CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/uploads/$UPC" -H "X-Noobty-Device: $A")
+check "cancelled session is gone" "404" "$CODE"
 
 echo "== download"
 curl -s -o "$TMP/dl.bin" "$BASE/api/files/$FID"

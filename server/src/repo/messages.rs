@@ -189,11 +189,13 @@ pub async fn last_per_conversation(
     let json = serde_json::to_string(&conversation_ids)
         .map_err(|e| crate::error::Error::Internal(anyhow::anyhow!("serialize ids: {e}")))?;
     db.exec(move |c| {
-        let mut stmt = c.prepare(&format!(
-            "{BASE_SELECT}, MAX(m.created_ms)
+        // 与 BASE_SELECT 同列,但聚合 MAX 必须在 SELECT 列表里,故独立成句
+        let mut stmt = c.prepare(
+            "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, m.acked_ms, f.id, f.name, f.size, MAX(m.created_ms)
+             FROM messages m LEFT JOIN files f ON f.id = m.file_id
              WHERE m.conversation_id IN (SELECT value FROM json_each(?1))
-             GROUP BY m.conversation_id"
-        ))?;
+             GROUP BY m.conversation_id",
+        )?;
         let rows = stmt
             .query_map(params![json], map_message)?
             .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;

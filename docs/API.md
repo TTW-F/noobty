@@ -73,10 +73,11 @@ Message view shape (REST + WS):
 | --- | --- | --- |
 | POST | `/api/uploads` | Body `{ "name", "size", "sha256?" }` → `201 { "upload_id", "file_id", "chunk_size", "received_bytes" }`. Name 1..=255 bytes, no path separators. `received_bytes > 0` when resuming a matching incomplete session (same device + name + size + sha256). Exceeding the storage cap → `507`. |
 | PUT | `/api/uploads/{upload_id}` | Raw binary body, `X-Noobty-Offset: <n>` **required** and must equal the server's authoritative `received_bytes` (default 4 MiB chunks; framework rejects larger bodies). Wrong offset → `409 { "error", "current_offset" }`. Another device's session → `403`. Response `{ "received_bytes": n }`. |
-| POST | `/api/uploads/{upload_id}/complete` | Verifies staged size (+ `sha256` if declared) → `201 { "file_id", "message"? }`. Body `{ "conversation_id", "as_message": true }` posts the file as a message. Only the owning device may complete. |
+| POST | `/api/uploads/{upload_id}/complete` | Verifies staged size (+ `sha256` if declared) → `201 { "file_id", "message"? }`. Body `{}` (or none) = pure store-and-forward; `{ "conversation_id": "..." }` also posts the file as a message into that conversation. Only the owning device may complete. |
+| DELETE | `/api/uploads/{upload_id}` | Cancel an in-progress upload (tus termination): session row + staging blob removed, reserved quota released. Owner only → 204. |
 | GET | `/api/uploads/{upload_id}` | `{ "upload_id", "file_id", "chunk_size", "size", "name", "received_bytes" }` — resume after interruption. |
 
-Guarantees: before each append the staging file is truncated to the authoritative offset (heals partial writes from aborted requests); bytes are fsynced before the metadata row claims them; the finished blob is promoted by atomic rename, so a visible file is always complete. Completion is serialised against in-flight appends (409 if a PUT is mid-stream). Sessions untouched for `upload_ttl_hours` (default 24) are swept — row deleted, staging blob removed, quota released.
+Guarantees: the server's authoritative offset is the number of bytes **actually present** in the staging file. A request that died mid-stream leaves bytes past its claim — they are trimmed before the next append. Bytes claimed but lost to a power cut rewind the offset (the next append answers `409` with the surviving count; the client re-sends from there). Staged bytes are fsynced **once, at completion** — a promoted (visible) file is always complete and durable. Completion and cancellation are serialised against in-flight appends (`409` if a PUT is mid-stream). Sessions untouched for `upload_ttl_hours` (default 24) are swept — row deleted, staging blob removed, quota released.
 
 ## Download
 

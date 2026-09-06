@@ -159,7 +159,10 @@ pub struct UploadCreateReq {
 
 #[derive(Debug, Deserialize)]
 pub struct CompleteOpts {
-    pub conversation_id: String,
+    /// When present, the completed file is posted as a file message into
+    /// this conversation. Absent (or `{}`) = pure store-and-forward.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 // ---------- REST responses ----------
