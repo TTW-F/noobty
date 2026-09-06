@@ -53,10 +53,21 @@ pub async fn download(
     headers: HeaderMap,
 ) -> Result<Response> {
     let entry = service::transfers::file_entry(&st, &file_id).await?;
-    let mut file = tokio::fs::File::open(st.blobs.file_path(&file_id))
-        .await
-        .map_err(|_| Error::NotFound(format!("content of file {file_id} is missing")))?;
+    let mut file = match tokio::fs::File::open(st.blobs.file_path(&file_id)).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!("download {file_id}: blob missing ({e})");
+            return Err(Error::NotFound(format!("content of file {file_id} is missing")));
+        }
+    };
     let size = file.metadata().await?.len();
+    tracing::info!(
+        "download {} name={} size={} range={:?}",
+        file_id,
+        entry.name,
+        size,
+        headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+    );
 
     let inline = q
         .inline

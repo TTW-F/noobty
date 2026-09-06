@@ -55,7 +55,7 @@ pub async fn download_to_dir(
     url: &str,
     name: &str,
     dir: &Path,
-    on_progress: Channel<DownloadProgress>,
+    on_progress: Option<Channel<DownloadProgress>>,
 ) -> Result<String, String> {
     tokio::fs::create_dir_all(dir)
         .await
@@ -85,14 +85,18 @@ pub async fn download_to_dir(
             .map_err(|e| format!("写入失败:{e}"))?;
         received += chunk.len() as u64;
         if last_sent.elapsed().as_millis() > 150 {
-            let _ = on_progress.send(DownloadProgress { received, total });
+            if let Some(ch) = &on_progress {
+                let _ = ch.send(DownloadProgress { received, total });
+            }
             last_sent = std::time::Instant::now();
         }
     }
     file.flush()
         .await
         .map_err(|e| format!("写入失败:{e}"))?;
-    let _ = on_progress.send(DownloadProgress { received, total });
+    if let Some(ch) = &on_progress {
+        let _ = ch.send(DownloadProgress { received, total });
+    }
 
     Ok(dest.to_string_lossy().to_string())
 }

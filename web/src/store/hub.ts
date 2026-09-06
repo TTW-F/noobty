@@ -1444,7 +1444,10 @@ export const useHub = create<HubState>((set, get) => {
               status: 'error',
               message: err instanceof Error ? err.message : '下载失败',
             })
-            get().pushToast('error', `${file.name}:下载失败`)
+            get().pushToast(
+              'error',
+              `${file.name}:${err instanceof Error ? err.message : '下载失败'}`,
+            )
           })
           .finally(() => downloadHandles.delete(file.file_id))
         return

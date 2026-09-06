@@ -93,8 +93,11 @@ export async function shellDownloadToDownloads(
     url: `${origin}/api/files/${encodeURIComponent(file.file_id)}`,
     name: file.name,
   }
-  if (typeof Channel === 'function' && onProgress) {
-    args.onProgress = new Channel<ShellDownloadProgress>({ onMessage: onProgress })
+  // Channel 可选;不传时 Rust 端静默落盘(自动接收路径)
+  if (typeof Channel === 'function') {
+    args.onProgress = new Channel<ShellDownloadProgress>({
+      onMessage: onProgress ?? (() => undefined),
+    })
   }
   try {
     const path = await invoke('download_to', args)

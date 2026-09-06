@@ -168,7 +168,7 @@ async fn download_to(
     state: tauri::State<'_, ShellState>,
     url: String,
     name: String,
-    on_progress: tauri::ipc::Channel<download::DownloadProgress>,
+    on_progress: Option<tauri::ipc::Channel<download::DownloadProgress>>,
 ) -> Result<String, String> {
     let hub = state.hub.lock().unwrap().clone();
     let dir_cfg = state.download_dir.lock().unwrap().clone();
