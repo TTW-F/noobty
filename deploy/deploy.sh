@@ -6,6 +6,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Non-login ssh/sudo shells often lack rustup's bin dir.
+export PATH="${HOME}/.cargo/bin:${PATH}"
+
 echo "[noobty] pulling latest source"
 git pull --ff-only
 
