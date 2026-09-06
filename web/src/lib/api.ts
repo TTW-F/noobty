@@ -1,4 +1,9 @@
-// REST 客户端 — 端点与语义见 docs/API.md
+// REST 客户端 — 端点与语义见 docs/API.md,并已对齐 server 的实现:
+// - DELETE 返回 204 无响应体
+// - 上传链路(PUT/GET/complete)同样要求 X-Noobty-Device 头
+// - complete 返回 { file_id, message }(message 为服务端生成的消息本体)
+// - 会话摘要为 { conversation_id, peer, last_message?: brief },无 unread 字段
+// - 大厅(lobby)为广播会话;旧中枢可能拒绝,客户端以探测结果门控
 import type { ConversationId, Device, HubVersion, Message, StorageInfo, UploadSession } from './types'
 
 export const DEVICE_STORAGE_KEY = 'noobty.device.v1'
@@ -40,11 +45,13 @@ export function clearIdentity(): void {
 
 export class ApiError extends Error {
   readonly status: number
+  readonly fallback?: string
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, fallback?: string) {
     super(message)
     this.status = status
     this.name = 'ApiError'
+    this.fallback = fallback
   }
 }
 
@@ -54,17 +61,39 @@ async function request<T>(path: string, init?: RequestInit & { deviceId?: string
   if (init?.body && typeof init.body === 'string') headers.set('Content-Type', 'application/json')
 
   const res = await fetch(path, { ...init, headers })
+  if (res.status === 204) return undefined as T
   if (!res.ok) {
     let message = `请求失败(${res.status})`
+    let fallback: string | undefined
     try {
-      const body = (await res.json()) as { error?: string }
+      const body = (await res.json()) as { error?: string; fallback?: string }
       if (typeof body.error === 'string' && body.error) message = body.error
+      if (typeof body.fallback === 'string') fallback = body.fallback
     } catch {
       // 非 JSON 错误体,保留默认文案
     }
-    throw new ApiError(res.status, message)
+    throw new ApiError(res.status, message, fallback)
   }
   return (await res.json()) as T
+}
+
+/** 会话摘要里的"最后一条消息"简报(服务端形状) */
+export interface LastMessageBrief {
+  message_id: string
+  created_at: string
+  kind: string
+  preview: string | null
+}
+
+export interface ConversationSummaryDTO {
+  conversation_id: string
+  peer: Device
+  last_message?: LastMessageBrief
+}
+
+export interface CompleteResp {
+  file_id: string
+  message?: Message
 }
 
 export const api = {
@@ -81,15 +110,18 @@ export const api = {
   listDevices: () => request<Device[]>('/api/devices'),
 
   listConversations: (deviceId: string) =>
-    request<{ conversation_id: string; last_message?: Message; unread: number }[]>(
-      '/api/conversations',
-      { deviceId },
-    ),
+    request<ConversationSummaryDTO[]>('/api/conversations', { deviceId }),
 
-  history: (conversationId: ConversationId, deviceId: string, before?: string, limit = 50) => {
+  history: (
+    conversationId: ConversationId,
+    deviceId: string,
+    opts: { before?: string; after?: string; after_seq?: number; limit?: number } = {},
+  ) => {
     const query = new URLSearchParams()
-    if (before) query.set('before', before)
-    query.set('limit', String(limit))
+    if (opts.before) query.set('before', opts.before)
+    if (opts.after) query.set('after', opts.after)
+    if (opts.after_seq != null) query.set('after_seq', String(opts.after_seq))
+    query.set('limit', String(opts.limit ?? 50))
     return request<{ messages: Message[] }>(
       `/api/conversations/${encodeURIComponent(conversationId)}/messages?${query}`,
       { deviceId },
@@ -104,13 +136,13 @@ export const api = {
     }),
 
   deleteMessage: (messageId: string, deviceId: string) =>
-    request<{ ok: boolean }>(`/api/messages/${encodeURIComponent(messageId)}`, {
+    request<undefined>(`/api/messages/${encodeURIComponent(messageId)}`, {
       method: 'DELETE',
       deviceId,
     }),
 
   deleteFile: (fileId: string, deviceId: string) =>
-    request<{ ok: boolean }>(`/api/files/${encodeURIComponent(fileId)}`, {
+    request<undefined>(`/api/files/${encodeURIComponent(fileId)}`, {
       method: 'DELETE',
       deviceId,
     }),
@@ -119,24 +151,73 @@ export const api = {
     request<UploadSession>('/api/uploads', {
       method: 'POST',
       deviceId,
-      body: JSON.stringify(size >= 0 ? { name, size, ...(sha256 ? { sha256 } : {}) } : { name, size }),
+      body: JSON.stringify({ name, size, ...(sha256 ? { sha256 } : {}) }),
     }),
 
-  queryUpload: (uploadId: string) =>
-    request<{ received_bytes: number; chunk_size: number }>(`/api/uploads/${encodeURIComponent(uploadId)}`),
+  queryUpload: (uploadId: string, deviceId: string) =>
+    request<{ received_bytes: number; chunk_size: number }>(`/api/uploads/${encodeURIComponent(uploadId)}`, {
+      deviceId,
+    }),
 
-  putChunk: (uploadId: string, offset: number, chunk: Blob) =>
+  putChunk: (uploadId: string, deviceId: string, offset: number, chunk: Blob) =>
     request<{ received_bytes: number }>(`/api/uploads/${encodeURIComponent(uploadId)}`, {
       method: 'PUT',
+      deviceId,
       headers: { 'X-Noobty-Offset': String(offset), 'Content-Type': 'application/octet-stream' },
       body: chunk,
     }),
 
-  completeUpload: (uploadId: string, conversationId: ConversationId) =>
-    request<{ file_id: string }>(`/api/uploads/${encodeURIComponent(uploadId)}/complete`, {
+  completeUpload: (uploadId: string, deviceId: string, conversationId?: ConversationId) =>
+    request<CompleteResp>(`/api/uploads/${encodeURIComponent(uploadId)}/complete`, {
       method: 'POST',
-      body: JSON.stringify({ conversation_id: conversationId, as_message: true }),
+      deviceId,
+      body: JSON.stringify(
+        conversationId
+          ? { conversation_id: conversationId, as_message: true }
+          : {},
+      ),
     }),
+
+  postFileGroup: (conversationId: ConversationId, deviceId: string, fileIds: string[]) =>
+    request<Message>(`/api/conversations/${encodeURIComponent(conversationId)}/file-groups`, {
+      method: 'POST',
+      deviceId,
+      body: JSON.stringify({ file_ids: fileIds }),
+    }),
+
+  createRelay: (deviceId: string, name: string, size: number, conversationId: ConversationId) =>
+    request<RelayCreated>('/api/relays', {
+      method: 'POST',
+      deviceId,
+      body: JSON.stringify({ name, size, conversation_id: conversationId }),
+    }),
+
+  /** 直转 PUT:整文件 body,边落盘边推接收方 */
+  putRelay: async (relayId: string, deviceId: string, body: Blob, signal?: AbortSignal) => {
+    const headers = new Headers({
+      'X-Noobty-Device': deviceId,
+      'Content-Type': 'application/octet-stream',
+    })
+    const res = await fetch(`/api/relays/${encodeURIComponent(relayId)}`, {
+      method: 'PUT',
+      headers,
+      body,
+      signal,
+    })
+    if (!res.ok) {
+      let message = `直转失败(${res.status})`
+      try {
+        const b = (await res.json()) as { error?: string }
+        if (b.error) message = b.error
+      } catch {
+        /* keep default */
+      }
+      throw new ApiError(res.status, message)
+    }
+    return (await res.json()) as CompleteResp
+  },
+
+  relayUrl: (relayId: string) => `/api/relays/${encodeURIComponent(relayId)}`,
 
   fileMeta: (fileId: string) =>
     request<{ file_id: string; name: string; size: number; uploaded_at: string; expires_at: string }>(
@@ -144,4 +225,13 @@ export const api = {
     ),
 
   fileUrl: (fileId: string) => `/api/files/${encodeURIComponent(fileId)}`,
+}
+
+export interface RelayCreated {
+  relay_id: string
+  file_id: string
+  name: string
+  size: number
+  conversation_id: string
+  to_device_id: string
 }

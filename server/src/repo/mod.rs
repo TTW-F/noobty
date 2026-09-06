@@ -121,5 +121,57 @@ fn migrate(conn: &Connection) -> Result<()> {
              PRAGMA user_version = 2;",
         )?;
     }
+    if version < 3 {
+        // v3: per-conversation monotonic sequence numbers — the recovery
+        // cursor clients replay from after a reconnect (Centrifugo-style
+        // offset, backed by durable history). Existing rows are backfilled
+        // in chronological order.
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN seq INTEGER;
+             CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
+             WITH numbered AS (
+                 SELECT id, ROW_NUMBER() OVER (
+                     PARTITION BY conversation_id ORDER BY created_ms, id
+                 ) AS rn
+                 FROM messages
+             )
+             UPDATE messages SET seq = (SELECT rn FROM numbered WHERE numbered.id = messages.id);
+             PRAGMA user_version = 3;",
+        )?;
+    }
+    if version < 4 {
+        // v4: file_group messages — batch/folder send as one chat card.
+        // SQLite cannot ALTER a CHECK constraint; rebuild the messages table.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE messages_v4 (
+                 id              TEXT PRIMARY KEY,
+                 conversation_id TEXT NOT NULL,
+                 from_device     TEXT NOT NULL,
+                 kind            TEXT NOT NULL CHECK (kind IN ('text','file','file_group')),
+                 text            TEXT,
+                 file_id         TEXT,
+                 created_ms      INTEGER NOT NULL,
+                 acked_ms        INTEGER,
+                 seq             INTEGER
+             );
+             INSERT INTO messages_v4
+                 SELECT id, conversation_id, from_device, kind, text, file_id, created_ms, acked_ms, seq
+                 FROM messages;
+             DROP TABLE messages;
+             ALTER TABLE messages_v4 RENAME TO messages;
+             CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_ms DESC, id DESC);
+             CREATE INDEX IF NOT EXISTS idx_messages_conv_seq ON messages(conversation_id, seq);
+             CREATE TABLE IF NOT EXISTS message_files (
+                 message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+                 file_id    TEXT NOT NULL,
+                 position   INTEGER NOT NULL,
+                 PRIMARY KEY (message_id, position)
+             );
+             CREATE INDEX IF NOT EXISTS idx_message_files_file ON message_files(file_id);
+             PRAGMA foreign_keys = ON;
+             PRAGMA user_version = 4;",
+        )?;
+    }
     Ok(())
 }

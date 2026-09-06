@@ -1,0 +1,29 @@
+[package]
+name = "noobty-shell"
+version = "0.1.0"
+description = "Noobty 托盘壳:常驻托盘,内嵌中枢网页 UI,提供通知与自动接收"
+edition = "2021"
+rust-version = "1.85"
+
+[lib]
+name = "noobty_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["fs", "io-util"] }
+dirs = "6"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -8,6 +8,7 @@ mod config;
 mod domain;
 mod error;
 mod realtime;
+mod relay;
 mod repo;
 mod service;
 mod state;
@@ -38,6 +39,37 @@ async fn main() {
     let state: SharedState = Arc::new(state::AppState::new(cfg).expect("failed to init state"));
     service::maintenance::spawn_sweeper(state.clone());
 
+    let chunk_limit = state.cfg.chunk_size;
+
+    // Upload chunks stay capped at chunk_size (tus appends).
+    let upload_routes = Router::new()
+        .route("/api/uploads", post(api::uploads::create))
+        .route(
+            "/api/uploads/{upload_id}",
+            get(api::uploads::info)
+                .put(api::uploads::put_chunk)
+                .delete(api::uploads::cancel),
+        )
+        .route(
+            "/api/uploads/{upload_id}/complete",
+            post(api::uploads::complete),
+        )
+        .layer(DefaultBodyLimit::max(chunk_limit))
+        .with_state(state.clone());
+
+    // Relay PUT is a full-file stream (tee to disk + live peer). Body size is
+    // enforced in service::relays::put_body against the declared size.
+    let relay_routes = Router::new()
+        .route("/api/relays", post(api::relays::create))
+        .route(
+            "/api/relays/{relay_id}",
+            get(api::relays::receive)
+                .put(api::relays::send)
+                .delete(api::relays::abort),
+        )
+        .layer(DefaultBodyLimit::disable())
+        .with_state(state.clone());
+
     let app = Router::new()
         .route("/api/healthz", get(api::healthz))
         .route("/api/devices/register", post(api::devices::register))
@@ -52,6 +84,10 @@ async fn main() {
             post(api::conversations::post_text),
         )
         .route(
+            "/api/conversations/{id}/file-groups",
+            post(api::conversations::post_file_group),
+        )
+        .route(
             "/api/conversations/{id}/messages",
             get(api::conversations::get_messages),
         )
@@ -59,28 +95,18 @@ async fn main() {
             "/api/messages/{message_id}",
             delete(api::conversations::delete_message),
         )
-        .route("/api/uploads", post(api::uploads::create))
-        .route(
-            "/api/uploads/{upload_id}",
-            get(api::uploads::info)
-                .put(api::uploads::put_chunk)
-                .delete(api::uploads::cancel),
-        )
-        .route(
-            "/api/uploads/{upload_id}/complete",
-            post(api::uploads::complete),
-        )
         .route(
             "/api/files/{file_id}",
             get(api::files::download).delete(api::files::delete_file),
         )
         .route("/api/files/{file_id}/meta", get(api::files::meta))
         .route("/api/storage", get(api::storage_info))
+        .merge(upload_routes)
+        .merge(relay_routes)
         .fallback_service(ServeDir::new(&state.cfg.web_dir))
         .layer(TraceLayer::new_for_http())
         // 托盘壳首启页(tauri.localhost)与跨源工具需要探测中枢;v1 局域网信任,放开 CORS
         .layer(CorsLayer::permissive())
-        .layer(DefaultBodyLimit::max(state.cfg.chunk_size))
         .with_state(state.clone());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], state.cfg.port));

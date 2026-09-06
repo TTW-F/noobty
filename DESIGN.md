@@ -130,7 +130,7 @@ Phosphor(`@phosphor-icons/react`),regular 字重,全站一族。按需具名导�
 
 | 交互 | 规格 |
 | --- | --- |
-| 回到底部按钮 | 消息流距底 >240px 时浮现(淡入+上移);离底期间收到新消息,按钮累计计数徽标;点击平滑回底(reduced-motion 立即) |
+| 回到底部按钮 | 消息流离底(>120px)时浮现(淡入+上移);离底期间收到新消息,按钮累计计数徽标;点击平滑回底(reduced-motion 立即) |
 | 吸附日期分隔 | 滚动时日期行吸附在消息流顶部,`bg/85 + backdrop-blur` 保证可读 |
 | 加载更早的历史 | 分页 50 条;顶部"查看更早的消息"按钮,加载后锚点恢复滚动位置,不跳动 |
 | 文本复制 | 文本气泡 hover 浮出复制动作,成功以 toast 确认 |
@@ -142,12 +142,24 @@ Phosphor(`@phosphor-icons/react`),regular 字重,全站一族。按需具名导�
 
 性能约定:会话行与消息行按行订阅 store 切片(父级不订阅整表),消息行 `memo`,长列表 `content-visibility: auto`;进度条不加补间(数字与填充必须一致)。
 
+## 12. 联调对齐注记(v1.2,对齐 server M1 实现)
+
+与真实中枢联调后固化的契约差异与前端适配:
+
+- **大厅是广播会话**:发到 `lobby` 的内容所有在线设备推送可见,离线设备靠 `after_seq` 追赶。前端以一次最小历史请求做能力探测;旧中枢拒绝时侧栏显示"当前中枢未开放",会话区显示解释性空态并禁用发送。桌面端默认会话为"第一台在线设备",无在线设备时停留大厅;自动代选会随在线状态纠偏,用户手动选择后不再干预。
+- **线程按收件人组织**:发往 B 的消息存储于线程 `private:B`,一次双人往来跨"我→B"与"我的收件箱"两条线程。客户端以"与某设备的对话"为显示单位做**双线程合并加载**,分页游标按线程各自维护;断线重连后按两条线程的最新 `seq` 以 `after_seq` 补拉。大厅为单线程。同一会话的加载做 in-flight 去重。
+- **回执已送达**:消息携带 `acked_at`(对方确认后出现);自己发的消息在时间戳旁显示青色双勾。
+- **删除同步**:任一设备删除消息广播 `message_deleted`(按消息 id 幂等移除);寄存文件清理广播 `file_deleted`,对应文件卡转为"已过期或已删除"且不可取件。
+- **恢复游标**:消息携带线程内单调 `seq`;断线重连优先用 `after_seq` 补拉(比 `after=<message_id>` 更稳,删消息后仍可续)。
+- **REST 细节**:DELETE 返回 204;上传的 PUT/查询/complete 同样要求 `X-Noobty-Device` 头;complete 响应携带生成的消息本体;会话摘要为 `{conversation_id, peer, last_message: brief}`(brief 含 preview,无 unread 字段,未读为端内计数)。
+- 会话列表行的选中(浅青底 + 图标块实心)与 hover(灰底)是两种视觉层级;未读为青色胶囊徽标。
+
 ## 10. 技术实现注记
 
 - **栈**:React 19 + Vite + TypeScript + Tailwind v4(`@tailwindcss/vite`)+ zustand + `motion/react` + Phosphor + `@fontsource/geist-mono`。原 Vue 脚手架为零代码占位模板,已替换;构建命令不变(`npm ci && npm run build`),产物仍由 server 托管于 `web/dist`。
 - **Mock 模式**:`?mock=1`(或 `VITE_MOCK=1`)拦截 fetch/WS,内置内存中枢模拟,用于无服务端时开发与视觉验证;生产构建不受影响。
 - **上传**:分块(服务端 `chunk_size`)+ 断点续传(`X-Noobty-Offset`,恢复时先 `GET /api/uploads/{id}`);≤256MB 计算 sha256 参与秒传/续传匹配,更大文件按 名字+大小 匹配。
 - **下载**:fetch 流式读取计进度,Range 断点(会话内),完成后 blob 触发另存;图片消息直接 `<img>` 指向文件端点。
-- **WS**:心跳 25s,指数退避重连(1s 起,封顶 15s);`hello` 同步设备快照,`presence` 增量更新;消息渲染后回 `ack_message`。
+- **WS**:心跳 25s;Full Jitter 指数退避重连(1s 起,封顶 15s,学自 Centrifugo/AWS);`hello` 同步设备快照,`presence` 增量更新;消息渲染后回 `ack_message`;重连后按线程 `after_seq` 补拉。
 - **PWA**:`manifest.webmanifest` + 图标,手机可加桌面图标;v1 不含 Service Worker 离线缓存。
 - 性能:图标具名导入(tree-shake);动效只 transform/opacity;历史列表 `content-visibility: auto`。

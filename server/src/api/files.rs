@@ -133,7 +133,7 @@ fn parse_single_range(spec: Option<&str>, size: u64) -> Result<Option<(u64, u64)
 
 /// Both filename forms: quoted ASCII fallback + RFC 5987 UTF-8 encoding,
 /// so non-ASCII names (压缩包.zip) survive every browser.
-fn content_disposition(name: &str) -> String {
+pub fn content_disposition(name: &str) -> String {
     let fallback: String = name
         .chars()
         .map(|c| {

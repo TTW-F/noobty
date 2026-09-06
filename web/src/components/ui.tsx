@@ -92,12 +92,15 @@ export function Dialog({
   title,
   children,
   width = 'max-w-sm',
+  dim = 'normal',
 }: {
   open: boolean
   onClose: () => void
   title?: string
   children: ReactNode
   width?: string
+  /** 灯箱等强层级场景用 deep,普通确认框用 normal */
+  dim?: 'normal' | 'deep'
 }) {
   const ref = useRef<HTMLDialogElement>(null)
 
@@ -120,7 +123,9 @@ export function Dialog({
         // 点到 backdrop(元素自身)时关闭
         if (e.target === ref.current) onClose()
       }}
-      className={`anim-pop m-auto w-[calc(100vw-32px)] ${width} rounded-[14px] border border-line bg-bg p-5 text-ink shadow-xl backdrop:bg-black/45 open:backdrop:anim-fade`}
+      className={`anim-pop m-auto w-[calc(100vw-32px)] ${width} rounded-[14px] border border-line bg-bg p-5 text-ink shadow-xl open:backdrop:anim-fade ${
+        dim === 'deep' ? 'backdrop:bg-black/70' : 'backdrop:bg-black/45'
+      }`}
     >
       {title && <h2 className="mb-3 text-[16px] font-semibold">{title}</h2>}
       {children}

@@ -1,97 +1,51 @@
-// 侧栏:身份块、会话列表(大厅 + 设备)、存储面板、中枢信息
+// 侧栏:身份块、视图切换(聊天/文件)、会话列表、存储表、中枢信息
 // 性能约定:每行自行订阅所需切片,父级不订阅整个 messages/lastMessages/unread 记录,
 // 避免任意会话的消息变动触发整个侧栏重渲染。
 import { useMemo, useState } from 'react'
 import {
   Broadcast,
-  CaretDown,
+  Chats,
   Check,
   Copy,
   HardDrives,
   Moon,
   PencilSimple,
   Sun,
-  Warning,
 } from '@phosphor-icons/react'
 import { useHub } from '../store/hub'
 import { Dialog, IconButton, PresenceDot } from './ui'
+import { StorageMeter } from './StorageMeter'
 import { deviceIcon } from '../lib/files'
-import { formatBytes, formatRelative } from '../lib/format'
+import { formatRelative } from '../lib/format'
 import { useTheme } from '../hooks/ui'
 import type { ConversationId, Message } from '../lib/types'
 
-// ---------- 存储面板 ----------
-
-const WARN_RATIO = 0.8
-
-function StorageMeter() {
-  const storage = useHub((s) => s.storage)
-  const [expanded, setExpanded] = useState(false)
-  if (!storage || storage.max_total_bytes <= 0) return null
-
-  const ratio = storage.used_bytes / storage.max_total_bytes
-  const warn = ratio >= WARN_RATIO
-  const percent = Math.round(ratio * 100)
-
+function ViewTabs() {
+  const view = useHub((s) => s.view)
+  const setView = useHub((s) => s.setView)
+  const tabs = [
+    { id: 'chats' as const, label: '聊天', icon: Chats },
+    { id: 'files' as const, label: '文件', icon: HardDrives },
+  ]
   return (
-    <div className="border-t border-line px-3.5 py-2.5">
-      <button
-        onClick={() => setExpanded((v) => !v)}
-        aria-expanded={expanded}
-        className="flex w-full items-center gap-1.5 rounded text-left"
-      >
-        <HardDrives size={13} className="shrink-0 text-muted" />
-        <span className="flex-1 text-[12px] font-medium text-muted">寄存空间</span>
-        <span className={`num text-[11px] ${warn ? 'text-warning' : 'text-muted'}`}>{percent}%</span>
-        <CaretDown
-          size={11}
-          className={`shrink-0 text-muted transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}
-        />
-      </button>
-
-      <div className="relative mt-2">
-        <div className="h-1 overflow-hidden rounded-full bg-surface-2">
-          <div
-            className={`h-full rounded-full transition-[width] duration-300 ${warn ? 'bg-warning' : 'bg-primary'}`}
-            style={{ width: `${Math.min(100, Math.max(1.5, ratio * 100))}%` }}
-          />
-        </div>
-        {/* 80% 告警阈值刻度 */}
-        <span aria-hidden className="absolute -bottom-0.5 -top-0.5 w-px bg-ink/25" style={{ left: '80%' }} />
-      </div>
-
-      {/* 展开详情:grid-rows 过渡,收起时不占布局 */}
-      <div
-        className={`grid transition-[grid-template-rows] duration-200 ease-out ${
-          expanded ? 'grid-rows-[1fr]' : 'grid-rows-[0fr]'
-        }`}
-      >
-        <div className="overflow-hidden">
-          <dl className="flex flex-col gap-1.5 pb-1 pt-3 text-[11.5px] leading-snug">
-            <div className="flex items-baseline justify-between gap-3">
-              <dt className="shrink-0 text-muted">已用 / 上限</dt>
-              <dd className="num text-right">
-                {formatBytes(storage.used_bytes)} / {formatBytes(storage.max_total_bytes)}
-              </dd>
-            </div>
-            <div className="flex items-baseline justify-between gap-3">
-              <dt className="shrink-0 text-muted">保留期限</dt>
-              <dd className="text-right">寄存文件保留 {storage.retention_days} 天</dd>
-            </div>
-            <div className="flex items-baseline justify-between gap-3">
-              <dt className="shrink-0 text-muted">容量告警</dt>
-              <dd className="text-right">达到上限后,从最早上传的文件开始清理</dd>
-            </div>
-          </dl>
-        </div>
-      </div>
-
-      {!expanded && (
-        <p className="mt-1.5 flex items-center gap-1 text-[11px] text-muted">
-          {warn && <Warning size={11} className="shrink-0 text-warning" weight="fill" />}
-          保留 {storage.retention_days} 天,到期自动清理
-        </p>
-      )}
+    <div className="flex gap-1 px-3 pb-1.5 pt-2.5" role="tablist" aria-label="视图切换">
+      {tabs.map((t) => {
+        const active = view === t.id
+        return (
+          <button
+            key={t.id}
+            role="tab"
+            aria-selected={active}
+            onClick={() => setView(t.id)}
+            className={`flex h-8 flex-1 items-center justify-center gap-1.5 rounded-[9px] text-[12.5px] transition-colors duration-150 ${
+              active ? 'bg-primary-soft font-medium text-primary-ink' : 'text-muted hover:bg-surface-2'
+            }`}
+          >
+            <t.icon size={14} weight={active ? 'fill' : 'regular'} />
+            {t.label}
+          </button>
+        )
+      })}
     </div>
   )
 }
@@ -128,6 +82,7 @@ function ConversationRow({
   active,
   online,
   isLobby,
+  m2 = false,
   onSelect,
 }: {
   conv: ConversationId
@@ -135,6 +90,7 @@ function ConversationRow({
   active: boolean
   online?: boolean
   isLobby?: boolean
+  m2?: boolean
   onSelect: () => void
 }) {
   const local = useHub((s) => s.messages[conv])
@@ -166,7 +122,9 @@ function ConversationRow({
             {summary.at ? formatRelative(summary.at) : ''}
           </span>
         </span>
-        <span className="block truncate text-[12px] text-muted">{summaryText(summary)}</span>
+        <span className="block truncate text-[12px] text-muted">
+          {m2 ? '当前中枢未开放 · 全员广播' : summaryText(summary)}
+        </span>
       </span>
       {unread > 0 && (
         <span className="num flex h-[18px] min-w-[18px] shrink-0 items-center justify-center rounded-full bg-primary px-1 text-[10.5px] font-semibold text-on-primary">
@@ -184,8 +142,11 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const devices = useHub((s) => s.devices)
   const activeConv = useHub((s) => s.activeConv)
   const setActiveConv = useHub((s) => s.setActiveConv)
+  const setView = useHub((s) => s.setView)
+  const view = useHub((s) => s.view)
   const renameDevice = useHub((s) => s.renameDevice)
   const hubVersion = useHub((s) => s.hubVersion)
+  const lobbySupported = useHub((s) => s.lobbySupported)
   const [theme, toggleTheme] = useTheme()
   const [copied, setCopied] = useState(false)
   const [renaming, setRenaming] = useState(false)
@@ -241,14 +202,21 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
         </IconButton>
       </div>
 
-      {/* 会话列表 */}
-      <nav aria-label="会话" className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
+      {/* 视图切换:聊天 / 文件仓库 */}
+      <ViewTabs />
+
+      {/* 会话列表(聊天视图) */}
+      <nav aria-label="会话" className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
         <ConversationRow
           conv="lobby"
           name="大厅"
           isLobby
-          active={activeConv === 'lobby'}
-          onSelect={() => setActiveConv('lobby')}
+          m2={lobbySupported === false}
+          active={view === 'chats' && activeConv === 'lobby'}
+          onSelect={() => {
+            setView('chats')
+            setActiveConv('lobby')
+          }}
         />
         {sorted.length > 0 && <div className="mx-2.5 my-2 border-t border-line" />}
         {sorted.map((d) => {
@@ -259,8 +227,11 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
               conv={conv}
               name={d.name}
               online={d.online}
-              active={activeConv === conv}
-              onSelect={() => setActiveConv(conv)}
+              active={view === 'chats' && activeConv === conv}
+              onSelect={() => {
+                setView('chats')
+                setActiveConv(conv)
+              }}
             />
           )
         })}

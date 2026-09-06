@@ -98,7 +98,7 @@ pub async fn finalize(
     message: Option<&Message>,
 ) -> Result<Option<Message>> {
     let e = entry.clone();
-    let m = message.cloned();
+    let mut returned = message.cloned();
     db.exec(move |c| {
         let tx = c.transaction()?;
         tx.execute(
@@ -115,14 +115,17 @@ pub async fn finalize(
             ],
         )?;
         tx.execute("DELETE FROM uploads WHERE id = ?1", params![upload_id])?;
-        if let Some(msg) = &m {
+        if let Some(msg) = &returned {
             let (kind, text, file_id) = match &msg.payload {
                 crate::domain::MessagePayload::Text(t) => ("text", Some(t.clone()), None),
                 crate::domain::MessagePayload::File(f) => ("file", None, Some(f.id.clone())),
+                crate::domain::MessagePayload::FileGroup(_) => unreachable!("upload complete posts single files"),
             };
-            tx.execute(
-                "INSERT INTO messages (id, conversation_id, from_device, kind, text, file_id, created_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            let seq: i64 = tx.query_row(
+                "INSERT INTO messages (id, conversation_id, from_device, kind, text, file_id, created_ms, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                         (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?2))
+                 RETURNING seq",
                 params![
                     msg.id,
                     msg.conversation_id,
@@ -132,10 +135,14 @@ pub async fn finalize(
                     file_id,
                     msg.created_ms
                 ],
+                |r| r.get(0),
             )?;
+            if let Some(owned) = &mut returned {
+                owned.seq = seq;
+            }
         }
         tx.commit()?;
-        Ok(m)
+        Ok(returned)
     })
     .await
 }

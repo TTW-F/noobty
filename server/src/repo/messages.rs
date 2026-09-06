@@ -7,14 +7,14 @@ use rusqlite::Row;
 use rusqlite::params;
 
 use crate::domain::{Message, MessagePayload, StoredFile};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::repo::Db;
 
-const BASE_SELECT: &str = "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, m.acked_ms, f.id, f.name, f.size
+const BASE_SELECT: &str = "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, m.seq, m.acked_ms, f.id, f.name, f.size
             FROM messages m LEFT JOIN files f ON f.id = m.file_id";
 
 pub struct RemovedMessage {
-    pub file_id: Option<String>,
+    pub file_ids: Vec<String>,
     pub conversation_id: String,
 }
 
@@ -25,18 +25,17 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
     let kind: String = r.get(3)?;
     let text: Option<String> = r.get(4)?;
     let created_ms: i64 = r.get(5)?;
-    let acked_ms: Option<i64> = r.get(6)?;
-    let file_id: Option<String> = r.get(7)?;
-    let file_name: Option<String> = r.get(8)?;
-    let file_size: Option<i64> = r.get(9)?;
+    let seq: i64 = r.get(6)?;
+    let acked_ms: Option<i64> = r.get(7)?;
+    let file_id: Option<String> = r.get(8)?;
+    let file_name: Option<String> = r.get(9)?;
+    let file_size: Option<i64> = r.get(10)?;
     let payload = match kind.as_str() {
         "text" => MessagePayload::Text(text.unwrap_or_default()),
         "file" => {
             let (Some(fid), Some(fname), Some(fsize)) = (file_id, file_name, file_size) else {
-                // A file message always joins to its file row; cascade deletes
-                // keep this true, so hitting this arm means corruption.
                 return Err(rusqlite::Error::FromSqlConversionFailure(
-                    7,
+                    8,
                     rusqlite::types::Type::Text,
                     "file message without matching file row".into(),
                 ));
@@ -47,6 +46,8 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
                 size: fsize as u64,
             })
         }
+        // Group members loaded in `hydrate_file_groups`.
+        "file_group" => MessagePayload::FileGroup(Vec::new()),
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 3,
@@ -60,36 +61,165 @@ fn map_message(r: &Row<'_>) -> rusqlite::Result<Message> {
         conversation_id,
         from_device_id,
         created_ms,
+        seq,
         acked_ms,
         payload,
     })
 }
 
-pub async fn insert(db: &Db, message: &Message) -> Result<()> {
-    let (kind, text, file_id) = match &message.payload {
-        crate::domain::MessagePayload::Text(t) => ("text", Some(t.clone()), None),
-        crate::domain::MessagePayload::File(f) => ("file", None, Some(f.id.clone())),
-    };
-    let m = message.clone();
+fn hydrate_file_groups(c: &rusqlite::Connection, messages: &mut [Message]) -> rusqlite::Result<()> {
+    for m in messages.iter_mut() {
+        if !matches!(m.payload, MessagePayload::FileGroup(_)) {
+            continue;
+        }
+        let mut stmt = c.prepare(
+            "SELECT f.id, f.name, f.size
+             FROM message_files mf
+             JOIN files f ON f.id = mf.file_id
+             WHERE mf.message_id = ?1
+             ORDER BY mf.position ASC",
+        )?;
+        let files = stmt
+            .query_map(params![m.id], |r| {
+                Ok(StoredFile {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        m.payload = MessagePayload::FileGroup(files);
+    }
+    Ok(())
+}
+
+fn load_mapped(
+    c: &rusqlite::Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> rusqlite::Result<Vec<Message>> {
+    let mut stmt = c.prepare(sql)?;
+    let mut rows = stmt
+        .query_map(params, map_message)?
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+    hydrate_file_groups(c, &mut rows)?;
+    Ok(rows)
+}
+
+/// Insert a message and allocate its per-conversation recovery sequence
+/// number atomically. Returns the assigned `seq`.
+pub async fn insert(db: &Db, message: &Message) -> Result<i64> {
+    match &message.payload {
+        MessagePayload::FileGroup(files) => {
+            let m = message.clone();
+            let files = files.clone();
+            db.exec(move |c| {
+                let tx = c.transaction()?;
+                let seq: i64 = tx.query_row(
+                    "INSERT INTO messages (id, conversation_id, from_device, kind, text, file_id, created_ms, seq)
+                     VALUES (?1, ?2, ?3, 'file_group', NULL, NULL, ?4,
+                             (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?2))
+                     RETURNING seq",
+                    params![m.id, m.conversation_id, m.from_device_id, m.created_ms],
+                    |r| r.get(0),
+                )?;
+                for (i, f) in files.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO message_files (message_id, file_id, position) VALUES (?1, ?2, ?3)",
+                        params![m.id, f.id, i as i64],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(seq)
+            })
+            .await
+        }
+        other => {
+            let (kind, text, file_id) = match other {
+                MessagePayload::Text(t) => ("text", Some(t.clone()), None),
+                MessagePayload::File(f) => ("file", None, Some(f.id.clone())),
+                MessagePayload::FileGroup(_) => unreachable!(),
+            };
+            let m = message.clone();
+            db.exec(move |c| {
+                c.query_row(
+                    "INSERT INTO messages (id, conversation_id, from_device, kind, text, file_id, created_ms, seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                             (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?2))
+                     RETURNING seq",
+                    params![
+                        m.id,
+                        m.conversation_id,
+                        m.from_device_id,
+                        kind,
+                        text,
+                        file_id,
+                        m.created_ms
+                    ],
+                    |r| r.get(0),
+                )
+            })
+            .await
+        }
+    }
+}
+
+/// Insert a committed file row + file message in one transaction (no upload
+/// session). Used by streaming relay after the blob is promoted to disk.
+pub async fn insert_stored_file(
+    db: &Db,
+    entry: &crate::domain::FileEntry,
+    message: &Message,
+) -> Result<Message> {
+    let e = entry.clone();
+    let mut returned = message.clone();
     db.exec(move |c| {
-        c.execute(
-            "INSERT INTO messages (id, conversation_id, from_device, kind, text, file_id, created_ms)
+        let tx = c.transaction()?;
+        tx.execute(
+            "INSERT INTO files (id, device_id, name, size, sha256, uploaded_ms, expires_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![m.id, m.conversation_id, m.from_device_id, kind, text, file_id, m.created_ms],
-        )
-        .map(|_| ())
+            params![
+                e.id,
+                e.device_id,
+                e.name,
+                e.size as i64,
+                e.sha256,
+                e.uploaded_ms,
+                e.expires_ms
+            ],
+        )?;
+        let (kind, text, file_id) = match &returned.payload {
+            MessagePayload::Text(t) => ("text", Some(t.clone()), None),
+            MessagePayload::File(f) => ("file", None, Some(f.id.clone())),
+            MessagePayload::FileGroup(_) => unreachable!("relay posts single-file messages"),
+        };
+        let seq: i64 = tx.query_row(
+            "INSERT INTO messages (id, conversation_id, from_device, kind, text, file_id, created_ms, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?2))
+             RETURNING seq",
+            params![
+                returned.id,
+                returned.conversation_id,
+                returned.from_device_id,
+                kind,
+                text,
+                file_id,
+                returned.created_ms
+            ],
+            |r| r.get(0),
+        )?;
+        returned.seq = seq;
+        tx.commit()?;
+        Ok(returned)
     })
     .await
 }
 
 pub async fn get(db: &Db, message_id: String) -> Result<Option<Message>> {
     db.exec(move |c| {
-        c.query_row(
-            &format!("{BASE_SELECT} WHERE m.id = ?1"),
-            params![message_id],
-            map_message,
-        )
-        .optional()
+        let mut rows = load_mapped(c, &format!("{BASE_SELECT} WHERE m.id = ?1"), params![message_id])?;
+        Ok(rows.pop())
     })
     .await
 }
@@ -109,13 +239,13 @@ pub async fn sender_of(db: &Db, message_id: String) -> Result<Option<String>> {
 /// Newest page, descending.
 pub async fn page_first(db: &Db, conversation_id: String, limit: i64) -> Result<Vec<Message>> {
     db.exec(move |c| {
-        let mut stmt = c.prepare(&format!(
-            "{BASE_SELECT} WHERE m.conversation_id = ?1 ORDER BY m.created_ms DESC, m.id DESC LIMIT ?2"
-        ))?;
-        let rows = stmt
-            .query_map(params![conversation_id, limit], map_message)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-        Ok(rows)
+        load_mapped(
+            c,
+            &format!(
+                "{BASE_SELECT} WHERE m.conversation_id = ?1 ORDER BY m.created_ms DESC, m.id DESC LIMIT ?2"
+            ),
+            params![conversation_id, limit],
+        )
     })
     .await
 }
@@ -128,18 +258,15 @@ pub async fn page_before(
     limit: i64,
 ) -> Result<Vec<Message>> {
     db.exec(move |c| {
-        let mut stmt = c.prepare(&format!(
-            "{BASE_SELECT}
+        load_mapped(
+            c,
+            &format!(
+                "{BASE_SELECT}
              WHERE m.conversation_id = ?1 AND (m.created_ms < ?2 OR (m.created_ms = ?2 AND m.id < ?3))
              ORDER BY m.created_ms DESC, m.id DESC LIMIT ?4"
-        ))?;
-        let rows = stmt
-            .query_map(
-                params![conversation_id, before.0, before.1, limit],
-                map_message,
-            )?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-        Ok(rows)
+            ),
+            params![conversation_id, before.0, before.1, limit],
+        )
     })
     .await
 }
@@ -153,15 +280,36 @@ pub async fn page_after(
     limit: i64,
 ) -> Result<Vec<Message>> {
     db.exec(move |c| {
-        let mut stmt = c.prepare(&format!(
-            "{BASE_SELECT}
+        load_mapped(
+            c,
+            &format!(
+                "{BASE_SELECT}
              WHERE m.conversation_id = ?1 AND (m.created_ms > ?2 OR (m.created_ms = ?2 AND m.id > ?3))
              ORDER BY m.created_ms ASC, m.id ASC LIMIT ?4"
-        ))?;
-        let rows = stmt
-            .query_map(params![conversation_id, after.0, after.1, limit], map_message)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
-        Ok(rows)
+            ),
+            params![conversation_id, after.0, after.1, limit],
+        )
+    })
+    .await
+}
+
+/// Messages with `seq` greater than the recovery cursor, ascending by seq.
+pub async fn page_after_seq(
+    db: &Db,
+    conversation_id: String,
+    after_seq: i64,
+    limit: i64,
+) -> Result<Vec<Message>> {
+    db.exec(move |c| {
+        load_mapped(
+            c,
+            &format!(
+                "{BASE_SELECT}
+             WHERE m.conversation_id = ?1 AND m.seq > ?2
+             ORDER BY m.seq ASC LIMIT ?3"
+            ),
+            params![conversation_id, after_seq, limit],
+        )
     })
     .await
 }
@@ -187,20 +335,18 @@ pub async fn last_per_conversation(
     conversation_ids: Vec<String>,
 ) -> Result<std::collections::HashMap<String, Message>> {
     let json = serde_json::to_string(&conversation_ids)
-        .map_err(|e| crate::error::Error::Internal(anyhow::anyhow!("serialize ids: {e}")))?;
+        .map_err(|e| Error::Internal(anyhow::anyhow!("serialize ids: {e}")))?;
     db.exec(move |c| {
-        // 与 BASE_SELECT 同列,但聚合 MAX 必须在 SELECT 列表里,故独立成句
-        let mut stmt = c.prepare(
-            "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, m.acked_ms, f.id, f.name, f.size, MAX(m.created_ms)
+        let mut rows = load_mapped(
+            c,
+            "SELECT m.id, m.conversation_id, m.from_device, m.kind, m.text, m.created_ms, m.seq, m.acked_ms, f.id, f.name, f.size, MAX(m.created_ms)
              FROM messages m LEFT JOIN files f ON f.id = m.file_id
              WHERE m.conversation_id IN (SELECT value FROM json_each(?1))
              GROUP BY m.conversation_id",
+            params![json],
         )?;
-        let rows = stmt
-            .query_map(params![json], map_message)?
-            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
         Ok(rows
-            .into_iter()
+            .drain(..)
             .map(|m| (m.conversation_id.clone(), m))
             .collect())
     })
@@ -211,22 +357,60 @@ pub async fn last_per_conversation(
 /// service layer can cascade blob deletion and emit events.
 pub async fn delete(db: &Db, message_id: String) -> Result<Option<RemovedMessage>> {
     db.exec(move |c| {
-        let removed = c
+        let conversation_id: Option<String> = c
             .query_row(
-                "SELECT file_id, conversation_id FROM messages WHERE id = ?1",
+                "SELECT conversation_id FROM messages WHERE id = ?1",
                 params![message_id],
-                |r| {
-                    Ok(RemovedMessage {
-                        file_id: r.get(0)?,
-                        conversation_id: r.get(1)?,
-                    })
-                },
+                |r| r.get(0),
             )
             .optional()?;
-        if removed.is_some() {
-            c.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+        let Some(conversation_id) = conversation_id else {
+            return Ok(None);
+        };
+
+        let mut file_ids: Vec<String> = c
+            .prepare("SELECT file_id FROM message_files WHERE message_id = ?1")?
+            .query_map(params![message_id], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        if file_ids.is_empty() {
+            if let Some(fid) = c
+                .query_row(
+                    "SELECT file_id FROM messages WHERE id = ?1",
+                    params![message_id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten()
+            {
+                file_ids.push(fid);
+            }
         }
-        Ok(removed)
+
+        c.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+        Ok(Some(RemovedMessage {
+            file_ids,
+            conversation_id,
+        }))
+    })
+    .await
+}
+
+/// True when this file_id is already attached to any message (single or group).
+pub async fn file_already_messaged(db: &Db, file_id: String) -> Result<bool> {
+    db.exec(move |c| {
+        let in_single: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE file_id = ?1)",
+            params![file_id],
+            |r| r.get(0),
+        )?;
+        if in_single {
+            return Ok(true);
+        }
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_files WHERE file_id = ?1)",
+            params![file_id],
+            |r| r.get(0),
+        )
     })
     .await
 }

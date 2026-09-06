@@ -1,0 +1,5 @@
+# 应用自定义命令的组合权限:允许(远程)页面调用壳命令
+[[permission]]
+identifier = "allow-shell-commands"
+description = "允许页面调用壳的命令:中枢配置、自动接收开关、文件自动接收下载"
+commands.allow = ["hub_url", "set_hub_url", "auto_accept", "download_to"]

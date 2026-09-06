@@ -3,6 +3,7 @@ import { memo, useEffect, useMemo, useState } from 'react'
 import { create } from 'zustand'
 import {
   ArrowsClockwise,
+  Checks,
   CheckCircle,
   Copy,
   DownloadSimple,
@@ -14,7 +15,7 @@ import {
 } from '@phosphor-icons/react'
 import { useHub } from '../store/hub'
 import { Button, ConfirmDialog, Dialog, Progress } from './ui'
-import { KIND_ICON, fileKind, isImage } from '../lib/files'
+import { KIND_ICON, KIND_LABEL, fileKind, isImage } from '../lib/files'
 import { formatBytes, formatClock, formatSpeed } from '../lib/format'
 import type { Device, FileRef, Message } from '../lib/types'
 
@@ -39,7 +40,7 @@ export function Lightbox() {
   const objectUrl = useLightbox((s) => s.objectUrl)
   const close = useLightbox((s) => s.close)
   return (
-    <Dialog open={file !== null} onClose={close} width="max-w-[min(92vw,960px)]">
+    <Dialog open={file !== null} onClose={close} width="max-w-[min(92vw,960px)]" dim="deep">
       <div className="flex flex-col gap-3">
         {objectUrl && file && (
           <img src={objectUrl} alt={file.name} className="max-h-[76vh] w-full self-center rounded-[10px] object-contain" />
@@ -60,99 +61,125 @@ export function Lightbox() {
   )
 }
 
-// ---------- 文件卡 ----------
+// ---------- 文件卡(附件卡) ----------
 
 export function FileCard({ file, mine, compact = false }: { file: FileRef; mine: boolean; compact?: boolean }) {
   const download = useHub((s) => s.download)
   const state = useHub((s) => s.downloads[file.file_id])
-  const Icon = KIND_ICON[fileKind(file.name)]
+  const dead = useHub((s) => Boolean(s.deadFiles[file.file_id]))
+  const retention = useHub((s) => s.storage?.retention_days)
+  const kind = fileKind(file.name)
+  const Icon = KIND_ICON[kind]
 
   const onGet = () => download(file)
 
   const statusLine = () => {
+    if (dead)
+      return (
+        <span className="flex items-center gap-1 text-[12px] text-warning">
+          <Warning size={13} weight="fill" /> 已过期或已删除
+        </span>
+      )
     if (!mine && state?.status === 'downloading') {
       return (
-        <span className="num text-[11.5px] text-primary-ink">
+        <span className="num text-[12px] text-primary-ink">
           {formatBytes(state.receivedBytes)} / {formatBytes(state.totalBytes)} · {formatSpeed(state.speed)}
         </span>
       )
     }
     if (!mine && state?.status === 'saved')
       return (
-        <span className="flex items-center gap-1 text-[11.5px] text-primary-ink">
-          <CheckCircle size={12} weight="fill" /> 已保存
+        <span className="flex items-center gap-1 text-[12px] text-primary-ink">
+          <CheckCircle size={13} weight="fill" /> 已保存
         </span>
       )
     if (!mine && state?.status === 'error')
       return (
-        <span className="flex items-center gap-1 text-[11.5px] text-danger">
-          <Warning size={12} weight="fill" /> {state.message.includes('404') ? '已过期或已删除' : '下载失败'}
+        <span className="flex items-center gap-1 text-[12px] text-danger">
+          <Warning size={13} weight="fill" /> {state.message.includes('404') ? '已过期或已删除' : '下载失败'}
         </span>
       )
-    return <span className="num text-[11.5px] text-muted">{formatBytes(file.size)}</span>
+    return <span className="num text-[12px] text-muted">{formatBytes(file.size)}</span>
   }
 
   const action = () => {
-    if (mine) return null
+    if (mine || dead) return null
     if (state?.status === 'downloading')
       return (
-        <span className="num text-[11.5px] font-medium text-primary-ink">
+        <span className="num text-[12px] font-medium text-primary-ink">
           {Math.round((state.receivedBytes / Math.max(1, state.totalBytes)) * 100)}%
         </span>
       )
     if (state?.status === 'saved')
       return (
-        <Button variant="ghost" className="h-7 px-2 text-[12px]" onClick={onGet}>
-          <ArrowsClockwise size={13} /> 重新下载
+        <Button variant="ghost" className="h-8 px-2.5 text-[12.5px]" onClick={onGet}>
+          <ArrowsClockwise size={14} /> 重新下载
         </Button>
       )
     if (state?.status === 'error')
       return (
-        <Button variant="secondary" className="h-7 px-2 text-[12px]" onClick={onGet}>
+        <Button variant="secondary" className="h-8 gap-1 px-3 text-[12.5px]" onClick={onGet}>
           重试
         </Button>
       )
     return (
-      <Button variant="secondary" className="h-7 gap-1 px-2.5 text-[12px]" onClick={onGet}>
-        <DownloadSimple size={13} weight="bold" /> 取件
+      <Button variant="secondary" className="h-8 gap-1 px-3 text-[12.5px]" onClick={onGet}>
+        <DownloadSimple size={14} weight="bold" /> 取件
       </Button>
     )
   }
 
   if (compact) {
     return (
-      <div className="flex items-center gap-2.5 px-3 py-2">
-        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[8px] bg-primary-soft text-primary-ink">
-          <Icon size={16} />
+      <div className="flex items-center gap-3 px-3.5 py-2.5">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[9px] bg-primary-soft text-primary-ink">
+          <Icon size={18} />
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13px] font-medium">{file.name}</span>
-          <span className="block">{statusLine()}</span>
+          <span className="block truncate text-[13.5px] font-medium leading-snug">{file.name}</span>
+          <span className="mt-0.5 block">{statusLine()}</span>
         </span>
-        {action()}
+        <span className="shrink-0">{action()}</span>
       </div>
     )
   }
 
+  // 附件卡:大图标 + 名称 + 类型/大小 + 状态 + 全宽主按钮,与消息条明显区分
   return (
-    <div className="w-[300px] max-w-full rounded-[12px] border border-line bg-bg p-3">
-      <div className="flex items-start gap-2.5">
-        <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-[10px] bg-primary-soft text-primary-ink">
-          <Icon size={20} />
+    <div className="w-[340px] max-w-full overflow-hidden rounded-[14px] border border-line bg-bg shadow-sm">
+      <div className="flex items-start gap-3 p-3.5 pb-3">
+        <span className="flex h-12 w-12 shrink-0 items-center justify-center rounded-[12px] bg-primary-soft text-primary-ink">
+          <Icon size={26} />
         </span>
-        <span className="min-w-0 flex-1">
-          <span className="block truncate text-[13.5px] font-medium leading-snug" title={file.name}>
+        <span className="min-w-0 flex-1 pt-0.5">
+          <span className="block break-all text-[15px] font-semibold leading-snug" title={file.name}>
             {file.name}
           </span>
-          <span className="mt-0.5 block">{statusLine()}</span>
+          <span className="num mt-1 block text-[12px] text-muted">
+            {KIND_LABEL[kind]} · {formatBytes(file.size)}
+          </span>
         </span>
-        <span className="shrink-0 pt-0.5">{action()}</span>
       </div>
       {!mine && state?.status === 'downloading' && (
-        <div className="mt-2.5">
+        <div className="px-3.5">
           <Progress value={state.totalBytes > 0 ? state.receivedBytes / state.totalBytes : 0} />
         </div>
       )}
+      <div className="flex items-center justify-between gap-2 px-3.5 pb-3.5 pt-2.5">
+        {/* 空闲态的尺寸已在头部展示,底部只放动态状态或一句提示 */}
+        {(() => {
+          const dynamic = !dead && state && state.status !== undefined
+          if (dynamic || dead) return statusLine()
+          return (
+            <span className="text-[12px] text-muted">
+              {mine
+                ? `已寄存${retention ? `,对方 ${retention} 天内可取` : ''}`
+                : `点击取件${retention ? `,文件保留 ${retention} 天` : ''}`}
+            </span>
+          )
+        })()}
+        {action()}
+      </div>
     </div>
   )
 }
@@ -200,7 +227,7 @@ export function ImageCard({ file }: { file: FileRef }) {
   return (
     <button
       onClick={() => objectUrl && openLightbox(file, objectUrl)}
-      className="block max-w-[320px] cursor-zoom-in overflow-hidden rounded-[12px] bg-surface-2"
+      className="relative block max-w-[340px] cursor-zoom-in overflow-hidden rounded-[14px] bg-surface-2"
       title={`${file.name} · ${formatBytes(file.size)} · 点按放大`}
     >
       {objectUrl && (
@@ -208,10 +235,16 @@ export function ImageCard({ file }: { file: FileRef }) {
           src={objectUrl}
           alt={file.name}
           onLoad={() => setLoaded(true)}
-          className={`max-h-64 w-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'h-40 opacity-0'}`}
+          className={`max-h-72 w-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'h-44 opacity-0'}`}
         />
       )}
-      {!objectUrl && <div className="h-32 w-64" />}
+      {!objectUrl && <div className="h-36 w-72" />}
+      {objectUrl && loaded && (
+        <span className="absolute inset-x-0 bottom-0 flex items-center gap-2 bg-gradient-to-t from-black/65 to-transparent px-3 pb-2 pt-6">
+          <span className="min-w-0 flex-1 truncate text-left text-[12.5px] font-medium text-white">{file.name}</span>
+          <span className="num shrink-0 text-[11.5px] text-white/85">{formatBytes(file.size)}</span>
+        </span>
+      )}
     </button>
   )
 }
@@ -307,7 +340,12 @@ export const MessageRow = memo(function MessageRow({ message, mine, grouped, sen
         )}
         <MessageBody message={message} mine={mine} />
       </div>
-      <span className="num shrink-0 select-none pb-0.5 text-[10.5px] text-muted/80">
+      <span className="num flex shrink-0 select-none items-center gap-0.5 pb-0.5 text-[10.5px] text-muted/80">
+        {mine && message.acked_at && (
+          <span title={`对方已于 ${formatClock(message.acked_at)} 看到`} className="text-primary-ink">
+            <Checks size={11} weight="bold" />
+          </span>
+        )}
         {formatClock(message.created_at)}
       </span>
       <span className={`mb-1 flex shrink-0 items-center gap-0.5 ${mine ? 'flex-row-reverse' : ''}`}>

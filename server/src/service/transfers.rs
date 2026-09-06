@@ -123,6 +123,7 @@ where
         return Err(Error::Conflict {
             message: "another append to this upload is in progress".into(),
             current_offset: Some(session.received_bytes),
+            fallback: None,
         });
     }
     // Drop-style unlock: every exit path below releases the per-upload lock.
@@ -142,6 +143,7 @@ where
         return Err(Error::Conflict {
             message: format!("offset {offset} does not match server offset"),
             current_offset: Some(authoritative),
+            fallback: None,
         });
     }
 
@@ -187,6 +189,7 @@ pub async fn complete_upload(
         return Err(Error::Conflict {
             message: "an append to this upload is in progress".into(),
             current_offset: Some(session.received_bytes),
+            fallback: None,
         });
     }
     let _guard = UploadLockGuard::new(st, &session.id);
@@ -228,6 +231,7 @@ pub async fn complete_upload(
                 conversation_id: conversation_id.clone(),
                 from_device_id: session.device_id.clone(),
                 created_ms: now,
+                seq: 0,
                 payload: MessagePayload::File(StoredFile {
                     id: session.file_id.clone(),
                     name: session.name.clone(),
@@ -235,7 +239,16 @@ pub async fn complete_upload(
                 }),
                 acked_ms: None,
             };
-            repo::uploads::finalize(&st.db, session.id.clone(), &entry, Some(&message)).await?;
+            // finalize assigns the message's per-conversation seq in the same
+            // transaction; the returned copy carries it.
+            let stored = repo::uploads::finalize(
+                &st.db,
+                session.id.clone(),
+                &entry,
+                Some(&message),
+            )
+            .await?;
+            let message = stored.expect("message row was inserted");
             crate::service::messaging::emit_message(st, &message, peer, &session.device_id);
             Some(message)
         }
@@ -256,6 +269,7 @@ pub async fn cancel_upload(st: &SharedState, session: &UploadSession) -> Result<
         return Err(Error::Conflict {
             message: "an append to this upload is in progress".into(),
             current_offset: Some(session.received_bytes),
+            fallback: None,
         });
     }
     let _guard = UploadLockGuard::new(st, &session.id);

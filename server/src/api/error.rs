@@ -26,10 +26,14 @@ impl IntoResponse for Error {
             Error::Conflict {
                 message,
                 current_offset,
+                fallback,
             } => {
                 let mut body = json!({ "error": message });
                 if let Some(offset) = current_offset {
                     body["current_offset"] = json!(offset);
+                }
+                if let Some(fb) = fallback {
+                    body["fallback"] = json!(fb);
                 }
                 (StatusCode::CONFLICT, Json(body)).into_response()
             }

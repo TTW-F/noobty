@@ -56,6 +56,18 @@ export const KIND_ICON: Record<FileKind, Icon> = {
   other: File,
 }
 
+export const KIND_LABEL: Record<FileKind, string> = {
+  image: '图片',
+  archive: '归档',
+  audio: '音频',
+  video: '视频',
+  pdf: 'PDF',
+  doc: '文档',
+  code: '代码',
+  text: '文本',
+  other: '文件',
+}
+
 export function isImage(name: string): boolean {
   return fileKind(name) === 'image'
 }

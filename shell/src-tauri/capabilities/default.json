@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Noobty 托盘壳默认能力:本地首启页 + 中枢远程页面均可访问核心 IPC 与通知",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://*:*", "http://*", "https://*:*", "https://*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "notification:default",
+    "autostart:default",
+    "allow-shell-commands"
+  ]
+}

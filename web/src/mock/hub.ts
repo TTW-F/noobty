@@ -1,5 +1,7 @@
 // Mock 中枢:?mock=1(或 VITE_MOCK=1)时拦截 fetch 与 WebSocket,
-// 在浏览器内模拟一台中枢,用于无服务端开发、演示与视觉验收。生产构建不受影响。
+// 在浏览器内模拟一台与 server M1 实现同契约的中枢,用于无服务端开发、演示与视觉验收。
+// 契约要点:删除返回 204;会话摘要为 brief;大厅为广播会话;消息只有 text/file 两种。
+// 生产构建不受影响。
 import type { ConversationId, Device, Message } from '../lib/types'
 
 export const mockEnabled =
@@ -34,33 +36,32 @@ function file(name: string, size: number, image = false): MockFile {
   return ref
 }
 
-// 预置的演示数据
+// 预置的演示数据(含大厅广播)
 const fZip = file('品牌设计-定稿.zip', 1_976_442_368)
 const fShot = file('IMG_20260905_2213.jpg', 3_918_442, true)
 const fTrip = file('旅行照片-精选.zip', 825_417_113)
-const fPlan = file('行程安排.xlsx', 38_912)
-const fSetup = file('SiliconNote-Setup.exe', 214_883_328)
-const fPatch = file('hotfix-1.4.2.zip', 12_884_901)
-const fDeck = file('周会演示.key', 96_337_725)
 
 const now = () => new Date().toISOString()
 
 const SEED: string[] = []
 const MESSAGES = new Map<string, Message[]>()
 
-function seed(conv: string, messages: Array<Omit<Message, 'conversation_id'>>): void {
+function seed(conv: string, messages: Array<Omit<Message, 'conversation_id' | 'seq'>>): void {
   SEED.push(conv)
   MESSAGES.set(
     conv,
-    messages.map((m) => ({ ...m, conversation_id: conv })),
+    messages.map((m, i) => ({ ...m, conversation_id: conv, seq: i + 1 })),
   )
 }
 
 seed('lobby', [
-  { message_id: 'm1', from_device_id: 'dev-desk', created_at: hoursAgo(26), kind: 'text', text: '路由器管理密码改好了,放在备忘录那个文件里,需要的自己取。' },
-  { message_id: 'm2', from_device_id: 'dev-laptop', created_at: hoursAgo(25), kind: 'file_group', mode: 'stored', files: [fTrip, fPlan].map((f) => ({ file_id: f.file_id, name: f.name, size: f.size })) },
-  { message_id: 'm3', from_device_id: 'dev-guest', created_at: hoursAgo(24.2), kind: 'text', text: '谢谢,照片我拷走了,很好看!' },
-  { message_id: 'm4', from_device_id: 'dev-desk', created_at: hoursAgo(3), kind: 'text', text: '打印机驱动换新的了,shared 文件夹里有备份。' },
+  {
+    message_id: 'm-lobby-1',
+    from_device_id: 'dev-desk',
+    created_at: hoursAgo(2.1),
+    kind: 'text',
+    text: '有人今晚用打印机吗?我要打一份合同。',
+  },
 ])
 
 seed('private:dev-desk', [
@@ -75,7 +76,7 @@ seed('private:dev-phone', [
 ])
 
 seed('private:dev-laptop', [
-  { message_id: 'm10', from_device_id: 'dev-laptop', created_at: hoursAgo(7.5), kind: 'file_group', mode: 'stored', files: [fSetup, fPatch, fDeck].map((f) => ({ file_id: f.file_id, name: f.name, size: f.size })) },
+  { message_id: 'm10', from_device_id: 'dev-laptop', created_at: hoursAgo(7.5), kind: 'file', mode: 'stored', file: { file_id: fTrip.file_id, name: fTrip.name, size: fTrip.size } },
   { message_id: 'm11', from_device_id: SELF_ID, created_at: hoursAgo(7.1), kind: 'text', text: '装好把安装包删了吧,省点寄存空间。' },
 ])
 
@@ -94,6 +95,8 @@ const uploads = new Map<
 const json = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } })
 
+const noContent = (): Response => new Response(null, { status: 204 })
+
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 function toMessageDTO(m: Message): Record<string, unknown> {
@@ -101,19 +104,27 @@ function toMessageDTO(m: Message): Record<string, unknown> {
     message_id: m.message_id,
     conversation_id: m.conversation_id,
     from_device_id: m.from_device_id,
+    seq: m.seq ?? 0,
     created_at: m.created_at,
     kind: m.kind,
   }
   if (m.text !== undefined) dto.text = m.text
   if (m.file) dto.file = m.file
-  if (m.files) dto.files = m.files
   if (m.mode) dto.mode = m.mode
+  if (m.acked_at) dto.acked_at = m.acked_at
   return dto
 }
 
-function broadcast(m: Message): void {
-  const frame = JSON.stringify({ type: 'message', ...toMessageDTO(m) })
-  for (const s of sockets) s.receive(frame)
+function nextSeq(conv: string): number {
+  const list = historyOf(conv)
+  let max = 0
+  for (const m of list) if (typeof m.seq === 'number' && m.seq > max) max = m.seq
+  return max + 1
+}
+
+function broadcast(frame: Record<string, unknown>): void {
+  const text = JSON.stringify(frame)
+  for (const s of sockets) s.receive(text)
 }
 
 function historyOf(conv: string): Message[] {
@@ -123,6 +134,14 @@ function historyOf(conv: string): Message[] {
 function lastOf(conv: string): Message | undefined {
   const list = historyOf(conv)
   return list[list.length - 1]
+}
+
+/** 未知会话拒绝;大厅是合法广播线程 */
+function assertConversation(conv: string): void {
+  if (conv === 'lobby') return
+  if (!conv.startsWith('private:') || conv === 'private:') {
+    throw new Error(`unknown conversation ${JSON.stringify(conv)}`)
+  }
 }
 
 // ---------------- fetch 拦截 ----------------
@@ -148,17 +167,44 @@ async function handleApi(
   }
 
   if (path === '/api/conversations' && method === 'GET') {
-    const convs = SEED.map((c) => ({
-      conversation_id: c,
-      last_message: lastOf(c) ? toMessageDTO(lastOf(c)!) : undefined,
-      unread: c === 'private:dev-phone' ? 2 : 0,
-    }))
+    // 与 server 一致:每个设备一个私聊会话 + 最后一条消息简报(无 unread、无大厅)
+    const convs = SEED.map((c) => {
+      const peerId = c.slice('private:'.length)
+      const peer = DEVICES.find((d) => d.device_id === peerId)!
+      const last = lastOf(c)
+      return {
+        conversation_id: c,
+        peer,
+        last_message: last
+          ? {
+              message_id: last.message_id,
+              created_at: last.created_at,
+              kind: last.kind,
+              preview: last.text ?? last.file?.name ?? null,
+            }
+          : undefined,
+      }
+    })
     return json(convs)
   }
 
   const msgMatch = path.match(/^\/api\/conversations\/(.+)\/messages$/)
   if (msgMatch && method === 'GET') {
     const conv = decodeURIComponent(msgMatch[1]!)
+    try {
+      assertConversation(conv)
+    } catch (e) {
+      return json({ error: (e as Error).message }, 400)
+    }
+    const afterSeq = url.searchParams.get('after_seq')
+    if (afterSeq != null) {
+      // 恢复游标:seq 严格大于 after_seq,升序(与 server page_after_seq 一致)
+      const cursor = Number(afterSeq) || 0
+      const list = historyOf(conv)
+        .filter((m) => (m.seq ?? 0) > cursor)
+        .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+      return json({ messages: list.map(toMessageDTO) })
+    }
     const list = [...historyOf(conv)].reverse() // 契约:最新在前
     return json({ messages: list.map(toMessageDTO) })
   }
@@ -166,17 +212,23 @@ async function handleApi(
   const textMatch = path.match(/^\/api\/conversations\/(.+)\/texts$/)
   if (textMatch && method === 'POST') {
     const conv = decodeURIComponent(textMatch[1]!)
+    try {
+      assertConversation(conv)
+    } catch (e) {
+      return json({ error: (e as Error).message }, 400)
+    }
     const text = (body as { text?: string })?.text ?? ''
     const m: Message = {
       message_id: `m-${msgCounter++}`,
       conversation_id: conv,
       from_device_id: SELF_ID,
+      seq: nextSeq(conv),
       created_at: now(),
       kind: 'text',
       text,
     }
     MESSAGES.set(conv, [...historyOf(conv), m])
-    broadcast(m)
+    broadcast({ type: 'message', ...toMessageDTO(m) })
     void autoReply(conv)
     return json(toMessageDTO(m))
   }
@@ -184,9 +236,21 @@ async function handleApi(
   if (path.startsWith('/api/messages/') && method === 'DELETE') {
     const id = decodeURIComponent(path.slice('/api/messages/'.length))
     for (const [conv, list] of MESSAGES) {
-      MESSAGES.set(conv, list.filter((m) => m.message_id !== id))
+      const target = list.find((m) => m.message_id === id)
+      if (!target) continue
+      MESSAGES.set(
+        conv,
+        list.filter((m) => m.message_id !== id),
+      )
+      broadcast({ type: 'message_deleted', message_id: id, conversation_id: conv })
+      // 级联清理寄存文件(与 server 的 purge_file 一致)
+      const fid = target.file?.file_id
+      if (fid) {
+        delete FILES[fid]
+        broadcast({ type: 'file_deleted', file_id: fid })
+      }
     }
-    return json({ ok: true })
+    return noContent()
   }
 
   if (path === '/api/uploads' && method === 'POST') {
@@ -214,20 +278,21 @@ async function handleApi(
     if (!up) return json({ error: '上传会话不存在' }, 404)
 
     if (upMatch[2] && method === 'POST') {
-      // complete:落一条文件消息并广播
+      // complete:落一条文件消息并广播,响应携带消息本体
       const fid = file(up.name, up.size || 1_048_576)
       const m: Message = {
         message_id: `m-${msgCounter++}`,
         conversation_id: up.conv,
         from_device_id: SELF_ID,
+        seq: nextSeq(up.conv),
         created_at: now(),
         kind: 'file',
         mode: 'stored',
         file: { file_id: fid.file_id, name: fid.name, size: fid.size },
       }
       MESSAGES.set(up.conv, [...historyOf(up.conv), m])
-      broadcast(m)
-      return json({ file_id: fid.file_id })
+      broadcast({ type: 'message', ...toMessageDTO(m) })
+      return json({ file_id: fid.file_id, message: toMessageDTO(m) })
     }
     if (method === 'GET') return json({ received_bytes: up.received, chunk_size: up.chunk })
     if (method === 'PUT') {
@@ -253,7 +318,11 @@ async function handleApi(
         expires_at: daysAgo(-5),
       })
     }
-    if (method === 'DELETE') return json({ ok: true })
+    if (method === 'DELETE') {
+      delete FILES[id]
+      broadcast({ type: 'file_deleted', file_id: id })
+      return noContent()
+    }
     // 演示文件:图片给一张 SVG,其余给说明文本
     if (f.image) {
       const svg = demoImage(f.name)
@@ -297,12 +366,13 @@ async function autoReply(conv: string): Promise<void> {
     message_id: `m-${msgCounter++}`,
     conversation_id: conv,
     from_device_id: target,
+    seq: nextSeq(conv),
     created_at: now(),
     kind: 'text',
     text: target === 'dev-laptop' ? '好,收到!' : '嗯嗯,这边看到了。',
   }
   MESSAGES.set(conv, [...historyOf(conv), m])
-  broadcast(m)
+  broadcast({ type: 'message', ...toMessageDTO(m) })
 }
 
 // ---------------- WebSocket 替身 ----------------

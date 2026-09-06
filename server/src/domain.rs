@@ -25,6 +25,8 @@ pub struct StoredFile {
 pub enum MessagePayload {
     Text(String),
     File(StoredFile),
+    /// Multiple files posted as one chat message (batch / folder send).
+    FileGroup(Vec<StoredFile>),
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,11 @@ pub struct Message {
     pub conversation_id: String,
     pub from_device_id: String,
     pub created_ms: i64,
+    /// Per-conversation monotonic sequence number (1-based), assigned by the
+    /// hub. This is the recovery cursor clients replay from after a
+    /// reconnect — the same role Centrifugo's channel `offset` plays, backed
+    /// by our durable SQLite history instead of an in-memory stream.
+    pub seq: i64,
     /// Delivery acknowledgement timestamp. Persisted so an ack survives the
     /// sender being offline; `None` until the receiver acknowledges.
     pub acked_ms: Option<i64>,
@@ -44,13 +51,15 @@ impl Message {
         match self.payload {
             MessagePayload::Text(_) => "text",
             MessagePayload::File(_) => "file",
+            MessagePayload::FileGroup(_) => "file_group",
         }
     }
 
     pub fn text_preview(&self) -> Option<&str> {
         match &self.payload {
             MessagePayload::Text(t) => Some(t),
-            MessagePayload::File(_) => None,
+            MessagePayload::File(f) => Some(&f.name),
+            MessagePayload::FileGroup(files) => files.first().map(|f| f.name.as_str()),
         }
     }
 }

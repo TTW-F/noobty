@@ -19,7 +19,7 @@ Noobty 的核心体验是"设备在线状态实时可见、消息和来件实时
 ## 决策
 
 1. **推送**：每设备一条 WebSocket 长连接。在线状态、新消息、删除、确认全部由中枢主动下发（`hello` / `presence` / `message` / `message_deleted` / `file_deleted` / `message_acked`）。
-2. **可靠性不靠推送兜底**：推送是 best-effort。每连接出站队列有界（128）；慢消费者被踢下线，重连后以 `GET /conversations/{id}/messages?after=<cursor>` 做历史追赶。**推送保实时，拉取保可靠**——这是 IM 领域的标准范式（与主流聊天系统一致）。
+2. **可靠性不靠推送兜底**：推送是 best-effort。每连接出站队列有界（128）；慢消费者被踢下线，重连后以 `GET /conversations/{id}/messages?after_seq=<n>`（优先）或遗留的 `after=<message_id>` 做历史追赶。**推送保实时，拉取保可靠**——这是 IM 领域的标准范式（与主流聊天系统一致）。
 3. 应用层 `ping`/`pong` 帧保活（与 WebSocket 协议层的 ping/pong 相互独立），空闲连接不静默死亡。
 
 ## 后果

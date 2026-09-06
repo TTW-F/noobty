@@ -20,12 +20,16 @@ export interface Message {
   message_id: string
   conversation_id: string
   from_device_id: string
+  /** 线程内单调序号(server 分配);断线补拉用 after_seq,比 message_id 游标更稳 */
+  seq?: number
   created_at: string
   kind: MessageKind
   text?: string
   file?: FileRef
   files?: FileRef[]
   mode?: TransferMode
+  /** 对方确认已看到的时间(server:MessageView.acked_at);仅对自己发的消息有意义 */
+  acked_at?: string
 }
 
 export type ConversationId = string // 'lobby' | `private:<device_id>`
@@ -50,6 +54,17 @@ export type ServerFrame =
   | (Message & { type: 'message' })
   | { type: 'transfer_progress'; transfer_id: string; message_id: string; bytes_done: number; bytes_total: number }
   | { type: 'message_acked'; message_id: string }
+  | { type: 'message_deleted'; message_id: string; conversation_id: string }
+  | { type: 'file_deleted'; file_id: string }
+  | {
+      type: 'relay_offer'
+      relay_id: string
+      from_device_id: string
+      conversation_id: string
+      name: string
+      size: number
+      file_id: string
+    }
   | { type: 'pong' }
 
 export type ClientFrame = { type: 'ping' } | { type: 'ack_message'; message_id: string }

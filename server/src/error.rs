@@ -10,10 +10,12 @@ pub enum Error {
     /// Authenticated identity may not act on the resource → 403.
     Forbidden(String),
     /// Precondition mismatch (e.g. tus offset). `current_offset` lets the
-    /// client resume without a second request → 409.
+    /// client resume without a second request → 409. `fallback` hints an
+    /// alternate mode (e.g. `"stored"` when relay peer is offline).
     Conflict {
         message: String,
         current_offset: Option<u64>,
+        fallback: Option<String>,
     },
     /// HTTP Range request cannot be satisfied → 416 (+ `Content-Range: bytes */size`).
     RangeNotSatisfiable(u64),

@@ -10,6 +10,7 @@ use crate::blob::BlobStore;
 use crate::config::Config;
 use crate::error::Result;
 use crate::realtime::Registry;
+use crate::relay::RelayRegistry;
 use crate::repo::Db;
 
 /// Shutdown broadcast. Triggered on SIGTERM/Ctrl+C: WebSocket handlers and
@@ -40,6 +41,7 @@ pub struct AppState {
     pub db: Db,
     pub blobs: BlobStore,
     pub registry: Registry,
+    pub relays: RelayRegistry,
     pub shutdown: Shutdown,
 }
 
@@ -55,6 +57,7 @@ impl AppState {
             db,
             blobs,
             registry: Registry::new(),
+            relays: RelayRegistry::new(),
             shutdown: Shutdown::new(),
         })
     }

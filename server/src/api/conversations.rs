@@ -21,6 +21,23 @@ pub async fn post_text(
     Ok((StatusCode::CREATED, Json((&message).into())))
 }
 
+pub async fn post_file_group(
+    State(st): State<SharedState>,
+    Path(conversation_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<wire::FileGroupReq>,
+) -> Result<(StatusCode, Json<wire::MessageView>)> {
+    let device = acting_device(&st, &headers).await?;
+    let message = service::messaging::post_file_group(
+        &st,
+        &device.id,
+        &conversation_id,
+        req.file_ids,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json((&message).into())))
+}
+
 pub async fn list_conversations(
     State(st): State<SharedState>,
 ) -> Result<Json<Vec<wire::ConversationSummary>>> {
@@ -51,6 +68,7 @@ pub async fn get_messages(
         &conversation_id,
         page.before,
         page.after,
+        page.after_seq,
         page.limit.unwrap_or(50),
     )
     .await?;

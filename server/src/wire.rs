@@ -41,6 +41,7 @@ impl From<DeviceWithStatus> for DeviceView {
 pub enum MessageKindView {
     Text,
     File,
+    FileGroup,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -55,12 +56,16 @@ pub struct MessageView {
     pub message_id: String,
     pub conversation_id: String,
     pub from_device_id: String,
+    /// Per-conversation monotonic recovery cursor (Centrifugo-style offset).
+    pub seq: i64,
     pub created_at: String,
     pub kind: MessageKindView,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<FileMetaView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<FileMetaView>>,
     /// Present once the receiver has acknowledged the message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acked_at: Option<String>,
@@ -68,8 +73,8 @@ pub struct MessageView {
 
 impl From<&Message> for MessageView {
     fn from(m: &Message) -> Self {
-        let (kind, text, file) = match &m.payload {
-            MessagePayload::Text(t) => (MessageKindView::Text, Some(t.clone()), None),
+        let (kind, text, file, files) = match &m.payload {
+            MessagePayload::Text(t) => (MessageKindView::Text, Some(t.clone()), None, None),
             MessagePayload::File(f) => (
                 MessageKindView::File,
                 None,
@@ -78,16 +83,34 @@ impl From<&Message> for MessageView {
                     name: f.name.clone(),
                     size: f.size,
                 }),
+                None,
+            ),
+            MessagePayload::FileGroup(group) => (
+                MessageKindView::FileGroup,
+                None,
+                None,
+                Some(
+                    group
+                        .iter()
+                        .map(|f| FileMetaView {
+                            file_id: f.id.clone(),
+                            name: f.name.clone(),
+                            size: f.size,
+                        })
+                        .collect(),
+                ),
             ),
         };
         MessageView {
             message_id: m.id.clone(),
             conversation_id: m.conversation_id.clone(),
             from_device_id: m.from_device_id.clone(),
+            seq: m.seq,
             created_at: ms_to_rfc3339(m.created_ms),
             kind,
             text,
             file,
+            files,
             acked_at: m.acked_ms.map(ms_to_rfc3339),
         }
     }
@@ -119,6 +142,16 @@ pub enum Event {
     FileDeleted {
         file_id: String,
     },
+    /// Peer is online and a streaming relay is ready: receiver should GET
+    /// `/api/relays/{relay_id}` while the sender PUTs. Bytes also land on disk.
+    RelayOffer {
+        relay_id: String,
+        from_device_id: String,
+        conversation_id: String,
+        name: String,
+        size: u64,
+        file_id: String,
+    },
     Pong,
 }
 
@@ -144,9 +177,18 @@ pub struct TextReq {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct FileGroupReq {
+    /// Already-uploaded file ids (complete without posting a message first).
+    pub file_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PageQuery {
     pub before: Option<String>,
     pub after: Option<String>,
+    /// Recovery cursor: replay messages newer than this per-conversation
+    /// sequence number, ascending (preferred over `after`).
+    pub after_seq: Option<i64>,
     pub limit: Option<i64>,
 }
 
@@ -183,6 +225,23 @@ pub struct UploadInfo {
     pub size: u64,
     pub name: String,
     pub received_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RelayCreateReq {
+    pub name: String,
+    pub size: u64,
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RelayCreated {
+    pub relay_id: String,
+    pub file_id: String,
+    pub name: String,
+    pub size: u64,
+    pub conversation_id: String,
+    pub to_device_id: String,
 }
 
 #[derive(Debug, Serialize)]

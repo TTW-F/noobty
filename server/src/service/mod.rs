@@ -6,4 +6,5 @@
 pub mod devices;
 pub mod maintenance;
 pub mod messaging;
+pub mod relays;
 pub mod transfers;

@@ -13,18 +13,21 @@ import { Button, EmptyState, IconButton, PresenceDot, Skeleton } from './ui'
 import { MessageRow } from './messages'
 import { Composer } from './Composer'
 import { formatDayLabel, formatRelative } from '../lib/format'
+import { filesFromDataTransfer } from '../lib/pick'
 import type { ConversationId, Message } from '../lib/types'
 
 const GROUP_WINDOW_MS = 3 * 60_000
-const JUMP_THRESHOLD_PX = 240
+/** 距底超过该值即视为"离底":显示回到底部按钮并累计新消息 */
+const OFF_BOTTOM_PX = 120
 const STICK_THRESHOLD_PX = 120
 
 // ---------- 消息流 ----------
 
-function MessageList({ conv, convName, isLobby, emptyIcon }: {
+function MessageList({ conv, convName, isLobby, lobbyM2, emptyIcon }: {
   conv: ConversationId
   convName: string
   isLobby: boolean
+  lobbyM2: boolean
   emptyIcon: React.ReactNode
 }) {
   const me = useHub((s) => s.me)
@@ -91,7 +94,7 @@ function MessageList({ conv, convName, isLobby, emptyIcon }: {
     if (!el) return
     const distance = el.scrollHeight - el.scrollTop - el.clientHeight
     stickToBottom.current = distance < STICK_THRESHOLD_PX
-    setShowJump(distance > JUMP_THRESHOLD_PX)
+    setShowJump(distance > OFF_BOTTOM_PX)
     if (stickToBottom.current) setPending(0)
   }
 
@@ -108,6 +111,17 @@ function MessageList({ conv, convName, isLobby, emptyIcon }: {
     const el = listRef.current
     if (el) anchorRef.current = { height: el.scrollHeight, top: el.scrollTop }
     loadOlder(conv)
+  }
+
+  // 旧中枢可能仍拒绝大厅:探测失败时给解释页,不给可交互假象
+  if (isLobby && lobbyM2) {
+    return (
+      <EmptyState
+        icon={<Broadcast size={26} />}
+        title="当前中枢尚未开放大厅"
+        hint="所有设备可见可取的广播会话需要中枢支持。先和某台设备私聊,或升级中枢后再试。"
+      />
+    )
   }
 
   if (historyStatus === undefined || historyStatus === 'loading') {
@@ -218,6 +232,7 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
   const sendFiles = useHub((s) => s.sendFiles)
   const status = useHub((s) => s.status)
   const retryConnection = useHub((s) => s.retryConnection)
+  const lobbySupported = useHub((s) => s.lobbySupported)
   const [dragging, setDragging] = useState(false)
   const dragDepth = useRef(0)
 
@@ -238,8 +253,11 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
   const peer = peerId ? devices.find((d) => d.device_id === peerId) : undefined
   const convName = isLobby ? '大厅' : (peer?.name ?? '已离开的设备')
 
+  const lobbySendable = !(isLobby && lobbySupported !== true)
+
   const onDragEnter = (e: DragEvent) => {
     e.preventDefault()
+    if (!lobbySendable) return
     if (!e.dataTransfer.types.includes('Files')) return
     dragDepth.current++
     setDragging(true)
@@ -254,8 +272,10 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
     e.preventDefault()
     dragDepth.current = 0
     setDragging(false)
-    const files = Array.from(e.dataTransfer.files)
-    if (files.length > 0) sendFiles(activeConv, files)
+    if (!lobbySendable) return
+    void filesFromDataTransfer(e.dataTransfer).then((files) => {
+      if (files.length > 0) sendFiles(activeConv, files)
+    })
   }
 
   return (
@@ -340,9 +360,11 @@ export function ChatPane({ mobile = false, onBack }: { mobile?: boolean; onBack?
         conv={activeConv}
         convName={convName}
         isLobby={isLobby}
+        lobbyM2={isLobby && lobbySupported === false}
         emptyIcon={<Plugs size={26} />}
       />
-      <Composer conv={activeConv} />
+      {/* 探测未出结果时也先禁用:杜绝把消息误发进大厅的窗口期 */}
+      <Composer conv={activeConv} disabled={isLobby && lobbySupported !== true} />
 
       {/* 拖拽遮罩 */}
       {dragging && (

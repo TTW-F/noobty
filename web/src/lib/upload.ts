@@ -1,6 +1,6 @@
 // 分块上传 + 断点续传(docs/API.md Upload 一节)
 // ≤ SHA256_MAX_BYTES 的文件计算 sha256 参与续传/秒传匹配;更大文件由服务端按 名字+大小 匹配。
-import { api } from './api'
+import { api, type CompleteResp } from './api'
 
 const SHA256_MAX_BYTES = 128 * 1024 * 1024
 const MAX_RETRIES = 5
@@ -23,20 +23,20 @@ async function sha256Hex(file: File): Promise<string | undefined> {
 }
 
 export interface UploadHandle {
-  promise: Promise<void>
+  promise: Promise<CompleteResp>
   cancel: () => void
 }
 
 export function uploadFile(
   file: File,
-  conversationId: string,
+  conversationId: string | undefined,
   deviceId: string,
   onProgress: (progress: UploadProgress) => void,
 ): UploadHandle {
   const controller = new AbortController()
   let uploadId: string | null = null
 
-  const promise = (async () => {
+  const promise = (async (): Promise<CompleteResp> => {
     const hash = await sha256Hex(file)
     if (controller.signal.aborted) throw new DOMException('已取消', 'AbortError')
 
@@ -65,7 +65,7 @@ export function uploadFile(
       let retries = 0
       for (;;) {
         try {
-          const res = await api.putChunk(uploadId, offset, chunk)
+          const res = await api.putChunk(uploadId, deviceId, offset, chunk)
           offset = Math.max(res.received_bytes, offset + chunk.size)
           break
         } catch (err) {
@@ -74,7 +74,7 @@ export function uploadFile(
           if (retries > MAX_RETRIES) throw err
           // 断点续传:查询服务端实际收到的字节数后继续
           await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** (retries - 1), 8000)))
-          const state = await api.queryUpload(uploadId)
+          const state = await api.queryUpload(uploadId, deviceId)
           offset = Math.min(state.received_bytes, file.size)
           report()
         }
@@ -82,15 +82,15 @@ export function uploadFile(
       report()
     }
 
-    await api.completeUpload(uploadId, conversationId)
+    const resp = await api.completeUpload(uploadId, deviceId, conversationId)
     onProgress({ sentBytes: file.size, speed: 0 })
+    return resp
   })()
 
   return {
     promise,
     cancel: () => {
       controller.abort()
-      // 已建立的上传会话留在服务端,续传语义允许下次复用
       void uploadId
     },
   }

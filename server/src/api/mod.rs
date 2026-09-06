@@ -6,6 +6,7 @@ pub mod conversations;
 pub mod devices;
 pub mod error;
 pub mod files;
+pub mod relays;
 pub mod uploads;
 pub mod ws;
 

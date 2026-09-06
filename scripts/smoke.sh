@@ -67,8 +67,10 @@ B=$(curl -s -X POST "$BASE/api/devices/register" -H 'content-type: application/j
 
 # WS listener on B: events must be PUSHED by the hub (no polling anywhere).
 # Every received message is auto-acked so the sender-side ack can be verified.
+# Lifetime is configurable so the test can simulate a disconnect.
 cat > "$TMP/ws_client.mjs" <<'EOF'
 const ws = new WebSocket(process.argv[2]);
+const lifetime = Number(process.argv[3] || 9000);
 ws.onmessage = (e) => {
   console.log("WS-EVENT", e.data);
   const frame = JSON.parse(e.data);
@@ -77,9 +79,10 @@ ws.onmessage = (e) => {
   }
 };
 ws.onopen = () => ws.send(JSON.stringify({ type: "ping" }));
-setTimeout(() => process.exit(0), 9000);
+ws.onclose = () => console.log("WS-CLOSED");
+setTimeout(() => process.exit(0), lifetime);
 EOF
-node "$TMP/ws_client.mjs" "ws://127.0.0.1:${PORT}/api/ws?device_id=$B" >"$TMP/ws.log" 2>&1 &
+node "$TMP/ws_client.mjs" "ws://127.0.0.1:${PORT}/api/ws?device_id=$B" 3500 >"$TMP/ws.log" 2>&1 &
 sleep 1.2
 
 echo "== realtime push"
@@ -93,6 +96,30 @@ grep -q '"kind":"text"' "$TMP/ws.log" && pass "text message pushed" || fail "tex
 sleep 0.6
 ACKED=$(curl -s "$BASE/api/conversations/private:$B/messages?limit=5" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);const m=o.messages.find(m=>m.kind==='text');console.log(m?.acked_at ?? '')})")
 [ -n "$ACKED" ] && pass "ack persisted (acked_at in history, survives offline sender)" || fail "ack persisted"
+
+echo "== seq recovery (disconnect → miss push → after_seq catch-up)"
+# Wait for B's WS to die so the next message is missed (push is best-effort).
+sleep 2.5
+# Snapshot the recovery cursor before the offline message lands.
+LAST_SEQ=$(curl -s "$BASE/api/conversations/private:$B/messages?limit=5" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);const n=Math.max(0,...(o.messages||[]).map(m=>m.seq||0));console.log(n)})")
+[ -n "$LAST_SEQ" ] && pass "recovery cursor seq=$LAST_SEQ" || fail "recovery cursor"
+curl -s -X POST "$BASE/api/conversations/private:$B/texts" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d '{"text":"missed while offline"}' >/dev/null
+# Offline: the dead WS must not have seen it.
+grep -q 'missed while offline' "$TMP/ws.log" && fail "offline message must not be pushed to dead WS" || pass "offline message not pushed (expected)"
+# Reconnect catch-up via after_seq (preferred over message-id cursor).
+CAUGHT=$(curl -s "$BASE/api/conversations/private:$B/messages?after_seq=${LAST_SEQ}&limit=50")
+CAUGHT_TEXT=$(printf '%s' "$CAUGHT" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);const m=(o.messages||[]).find(x=>x.text==='missed while offline');console.log(m?m.seq:'')})")
+[ -n "$CAUGHT_TEXT" ] && pass "after_seq catch-up recovers missed message (seq=$CAUGHT_TEXT)" || fail "after_seq catch-up"
+# seq must be strictly monotonic and present on every message view.
+HAS_SEQ=$(curl -s "$BASE/api/conversations/private:$B/messages?limit=20" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const ms=JSON.parse(d).messages||[];const ok=ms.length>0&&ms.every(m=>Number.isInteger(m.seq)&&m.seq>=1);console.log(ok?'yes':'no')})")
+check "every message carries seq >= 1" "yes" "$HAS_SEQ"
+
+# Re-attach B for the remaining push assertions (upload → file message).
+: >"$TMP/ws.log"
+node "$TMP/ws_client.mjs" "ws://127.0.0.1:${PORT}/api/ws?device_id=$B" 20000 >"$TMP/ws.log" 2>&1 &
+sleep 0.8
 
 echo "== resumable upload (tus-style sequential append)"
 head -c 262144 /dev/urandom >"$TMP/blob.bin"
@@ -150,6 +177,95 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE "$BASE/api/messages/$MID
 check "delete file message" "204" "$CODE"
 check "blob removed from disk" "0" "$(( $(ls "$TMP/data/files" 2>/dev/null | wc -l) ))"
 check "quota freed" "0" "$(curl -s "$BASE/api/storage" | jid used_bytes)"
+
+echo "== lobby broadcast"
+# Both A and B online: a lobby text must fan-out to every live socket.
+: >"$TMP/ws_a.log"
+: >"$TMP/ws_b.log"
+node "$TMP/ws_client.mjs" "ws://127.0.0.1:${PORT}/api/ws?device_id=$A" 6000 >"$TMP/ws_a.log" 2>&1 &
+node "$TMP/ws_client.mjs" "ws://127.0.0.1:${PORT}/api/ws?device_id=$B" 6000 >"$TMP/ws_b.log" 2>&1 &
+sleep 0.8
+LOBBY=$(curl -s -X POST "$BASE/api/conversations/lobby/texts" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d '{"text":"lobby hello everyone"}')
+LOBBY_SEQ=$(printf '%s' "$LOBBY" | jid seq)
+[ -n "$LOBBY_SEQ" ] && pass "lobby text accepted (seq=$LOBBY_SEQ)" || fail "lobby text accepted"
+sleep 0.6
+grep -q 'lobby hello everyone' "$TMP/ws_a.log" && pass "lobby echoed to sender" || fail "lobby echoed to sender"
+grep -q 'lobby hello everyone' "$TMP/ws_b.log" && pass "lobby pushed to peer" || fail "lobby pushed to peer"
+# History on the shared thread is readable by any device.
+LOBBY_HIST=$(curl -s "$BASE/api/conversations/lobby/messages?limit=5" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);const m=(o.messages||[]).find(x=>x.text==='lobby hello everyone');console.log(m&&m.conversation_id==='lobby'?'yes':'no')})")
+check "lobby history readable" "yes" "$LOBBY_HIST"
+
+echo "== streaming relay (tee to disk + live splice)"
+# Offline peer → must fall back to store-and-forward.
+CODE=$(curl -s -o "$TMP/relay_off.json" -w "%{http_code}" -X POST "$BASE/api/relays" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d "{\"name\":\"offline.bin\",\"size\":16,\"conversation_id\":\"private:$B\"}")
+# B's WS from lobby section may still be alive — kill wait then re-check with a
+# device that has no socket: register C with no WS.
+C=$(curl -s -X POST "$BASE/api/devices/register" -H 'content-type: application/json' -d '{"name":"smoke-c"}' | jid device_id)
+CODE=$(curl -s -o "$TMP/relay_off.json" -w "%{http_code}" -X POST "$BASE/api/relays" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d "{\"name\":\"offline.bin\",\"size\":16,\"conversation_id\":\"private:$C\"}")
+check "offline peer → 409" "409" "$CODE"
+check "offline peer → fallback stored" "stored" "$(jid fallback <"$TMP/relay_off.json")"
+
+# Live splice: keep B online, A offers, B GETs while A PUTs; bytes land on disk.
+: >"$TMP/ws_b2.log"
+node "$TMP/ws_client.mjs" "ws://127.0.0.1:${PORT}/api/ws?device_id=$B" 20000 >"$TMP/ws_b2.log" 2>&1 &
+sleep 0.8
+printf 'relay-payload-ok!!' >"$TMP/relay.bin"
+RELAY_SIZE=$(wc -c <"$TMP/relay.bin" | tr -d ' ')
+RELAY=$(curl -s -X POST "$BASE/api/relays" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d "{\"name\":\"直转.bin\",\"size\":$RELAY_SIZE,\"conversation_id\":\"private:$B\"}")
+RID=$(printf '%s' "$RELAY" | jid relay_id)
+RFID=$(printf '%s' "$RELAY" | jid file_id)
+[ -n "$RID" ] && pass "relay created ($RID)" || fail "relay created"
+sleep 0.4
+grep -q '"type":"relay_offer"' "$TMP/ws_b2.log" && pass "relay_offer pushed to peer" || fail "relay_offer pushed to peer"
+
+# Receiver attaches first (background), then sender PUTs.
+curl -s -o "$TMP/relay_out.bin" -H "X-Noobty-Device: $B" "$BASE/api/relays/$RID" &
+RCPID=$!
+sleep 0.3
+PUTRESP=$(curl -s -X PUT "$BASE/api/relays/$RID" -H "X-Noobty-Device: $A" \
+  -H 'content-type: application/octet-stream' --data-binary @"$TMP/relay.bin")
+wait "$RCPID" 2>/dev/null || true
+PUT_FID=$(printf '%s' "$PUTRESP" | jid file_id)
+[ "$PUT_FID" = "$RFID" ] && pass "relay PUT completed (file on disk)" || fail "relay PUT completed"
+cmp -s "$TMP/relay.bin" "$TMP/relay_out.bin" && pass "live splice bytes match" || fail "live splice bytes match"
+curl -s -o "$TMP/relay_disk.bin" "$BASE/api/files/$RFID"
+check "stored blob matches (tee)" "yes" "$(cmp -s "$TMP/relay.bin" "$TMP/relay_disk.bin" && echo yes || echo no)"
+# Cleanup relay test file so later quota assertions stay simple if re-run mid-script.
+curl -s -o /dev/null -X DELETE "$BASE/api/files/$RFID" -H "X-Noobty-Device: $A" || true
+
+echo "== file_group batch"
+# Upload two files without posting messages, then assemble one file_group card.
+printf 'batch-a' >"$TMP/ga.bin"
+printf 'batch-bb' >"$TMP/gb.bin"
+GA=$(curl -s -X POST "$BASE/api/uploads" -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d '{"name":"a.txt","size":7}' | jid upload_id)
+GB=$(curl -s -X POST "$BASE/api/uploads" -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d '{"name":"b.txt","size":8}' | jid upload_id)
+curl -s -X PUT "$BASE/api/uploads/$GA" -H "X-Noobty-Device: $A" -H "X-Noobty-Offset: 0" --data-binary @"$TMP/ga.bin" >/dev/null
+curl -s -X PUT "$BASE/api/uploads/$GB" -H "X-Noobty-Device: $A" -H "X-Noobty-Offset: 0" --data-binary @"$TMP/gb.bin" >/dev/null
+FA=$(curl -s -X POST "$BASE/api/uploads/$GA/complete" -H "X-Noobty-Device: $A" -H 'content-type: application/json' -d '{}' | jid file_id)
+FB=$(curl -s -X POST "$BASE/api/uploads/$GB/complete" -H "X-Noobty-Device: $A" -H 'content-type: application/json' -d '{}' | jid file_id)
+[ -n "$FA" ] && [ -n "$FB" ] && pass "batch files stored without messages" || fail "batch files stored without messages"
+GROUP=$(curl -s -X POST "$BASE/api/conversations/private:$B/file-groups" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d "{\"file_ids\":[\"$FA\",\"$FB\"]}")
+GKIND=$(printf '%s' "$GROUP" | jid kind)
+GCOUNT=$(printf '%s' "$GROUP" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const o=JSON.parse(d);console.log((o.files||[]).length)})")
+check "file_group kind" "file_group" "$GKIND"
+check "file_group has 2 files" "2" "$GCOUNT"
+# Reject single-file group
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/conversations/private:$B/file-groups" \
+  -H "X-Noobty-Device: $A" -H 'content-type: application/json' \
+  -d "{\"file_ids\":[\"$FA\"]}")
+check "file_group rejects <2 files" "400" "$CODE"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
