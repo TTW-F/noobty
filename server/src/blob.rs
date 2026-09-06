@@ -22,6 +22,7 @@ impl BlobStore {
         std::fs::create_dir_all(root.join("files"))?;
         std::fs::create_dir_all(root.join("tmp"))?;
         std::fs::create_dir_all(root.join("thumbs"))?;
+        std::fs::create_dir_all(root.join("releases").join("shell"))?;
         Ok(Self {
             root,
             inflight_uploads: Mutex::new(HashSet::new()),
@@ -39,6 +40,11 @@ impl BlobStore {
     /// Cached JPEG thumbnail for image previews (warehouse / chat).
     pub fn thumb_path(&self, file_id: &str) -> PathBuf {
         self.root.join("thumbs").join(format!("{file_id}.jpg"))
+    }
+
+    /// Tray shell release artifacts (`latest` meta + NSIS installer).
+    pub fn releases_shell_dir(&self) -> PathBuf {
+        self.root.join("releases").join("shell")
     }
 
     pub fn try_lock_upload(&self, upload_id: &str) -> bool {

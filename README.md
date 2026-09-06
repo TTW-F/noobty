@@ -21,12 +21,13 @@ Sending a big archive over WeChat is slow and capped by size limits. On a LAN yo
 
 ## Status
 
-🚧 Work in progress. Scope and roadmap: [docs/requirements.md](docs/requirements.md) · domain glossary: [CONTEXT.md](CONTEXT.md) · architecture decisions: [docs/adr/](docs/adr/)
+🚧 Work in progress. Scope and roadmap: [docs/requirements.md](docs/requirements.md) · domain glossary: [CONTEXT.md](CONTEXT.md) · architecture decisions: [docs/adr/](docs/adr/) · releasing: [docs/RELEASING.md](docs/RELEASING.md) · changelog: [CHANGELOG.md](CHANGELOG.md)
 
 - [x] M0 — monorepo skeleton, hub server skeleton, deployment plan
 - [x] M1 (backend) — hub server: store-and-forward, private chats, text/file messages, resumable (tus-style) uploads, HTTP-Range downloads, history with catch-up cursors, WebSocket presence & push, retention/quota sweeper. Web UI in progress.
 - [x] M2 — lobby, streaming relay (tee), multi-file/folder `file_group` batches
-- [x] M3 — Windows tray shell (notifications, auto-accept to `Downloads\Noobty`, HTML5 drag-send). See [shell/](shell/)
+- [x] M3 — Windows tray shell (notifications, auto-accept to configurable receive dir, HTML5 drag-send). See [shell/](shell/)
+- [x] M3.1 — shell versioning / signed updates via hub `/releases/shell`, NSIS uninstall cleanup
 - [ ] M4 — auth + optional WAN exposure; toolbox features
 
 ## Development

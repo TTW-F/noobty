@@ -15,6 +15,7 @@ use tauri::{
 };
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_updater::UpdaterExt;
 
 /// 壳运行状态(供托盘菜单与命令共享)
 struct ShellState {
@@ -51,6 +52,14 @@ fn set_hub_url(state: tauri::State<ShellState>, url: String) -> Result<(), Strin
     let url = url.trim().trim_end_matches('/').to_string();
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("地址必须以 http:// 或 https:// 开头".into());
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("://localhost") || lower.contains("://127.0.0.1") || lower.contains("://[::1]")
+    {
+        return Err(
+            "不要填 localhost：壳和中枢不在同一台机器时会连不上。请填中枢的局域网地址，例如 http://192.168.31.35:7317"
+                .into(),
+        );
     }
     config::save_hub(&url)?;
     *state.hub.lock().unwrap() = url;
@@ -185,6 +194,57 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+fn notify_tray(app: &tauri::AppHandle, title: &str, body: &str) {
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// 用当前中枢地址拉 latest.json;有更新则被动安装(Windows 会先退出本进程)。
+async fn check_and_install_update(app: tauri::AppHandle) -> Result<String, String> {
+    let hub = {
+        let state = app.state::<ShellState>();
+        let hub = state.hub.lock().unwrap().clone();
+        hub
+    };
+    if hub.trim().is_empty() {
+        return Err("尚未配置中枢地址".into());
+    }
+    let endpoint = format!(
+        "{}/releases/shell/latest.json",
+        hub.trim().trim_end_matches('/')
+    );
+    let endpoint_url: url::Url = endpoint
+        .parse()
+        .map_err(|e| format!("更新地址无效:{e}"))?;
+
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint_url])
+        .map_err(|e| e.to_string())?
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(format!("已是最新版本 ({})", env!("CARGO_PKG_VERSION")));
+    };
+
+    let notes = update.body.clone().unwrap_or_default();
+    notify_tray(
+        &app,
+        &format!("正在更新到 {}", update.version),
+        if notes.is_empty() {
+            "下载并安装中…"
+        } else {
+            notes.as_str()
+        },
+    );
+
+    update
+        .download_and_install(|_chunk_len, _content_len| {}, || {})
+        .await
+        .map_err(|e: tauri_plugin_updater::Error| e.to_string())?;
+    Ok(format!("已安装 {}，请重新打开 Noobty", update.version))
+}
+
 fn open_hub_setup(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         // Windows WebView2 的 App 资源源是 http://tauri.localhost(非 WebviewUrl)
@@ -235,6 +295,7 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(ShellState {
             hub: Mutex::new(initial_hub),
             auto_accept: AtomicBool::new(initial_auto),
@@ -292,6 +353,8 @@ pub fn run() {
                 let enabled = app.autolaunch().is_enabled().unwrap_or(false);
                 CheckMenuItem::with_id(app, "autostart", "开机自启", true, enabled, None::<&str>)?
             };
+            let check_update =
+                MenuItem::with_id(app, "check_update", "检查更新…", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出 Noobty", true, None::<&str>)?;
             let menu = Menu::with_items(
                 app,
@@ -302,6 +365,7 @@ pub fn run() {
                     &reset_dir,
                     &auto_item,
                     &launch_item,
+                    &check_update,
                     &quit,
                 ],
             )?;
@@ -336,6 +400,15 @@ pub fn run() {
                             .title("已恢复默认接收目录")
                             .body(resolved.to_string_lossy())
                             .show();
+                    }
+                    "check_update" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            match check_and_install_update(app.clone()).await {
+                                Ok(msg) => notify_tray(&app, "检查更新", &msg),
+                                Err(e) => notify_tray(&app, "检查更新失败", &e),
+                            }
+                        });
                     }
                     "quit" => app.exit(0),
                     "auto_accept" => {

@@ -9,6 +9,10 @@ dist/
 config.toml
 data/
 
+# Updater signing private key — NEVER commit
+.keys/*
+!.keys/README.md
+
 # Local ops notes (real IPs, SSH aliases, server facts) — never publish
 deploy/local.md
 

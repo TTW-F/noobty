@@ -101,6 +101,9 @@ Guarantees: the server's authoritative offset is the number of bytes **actually 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/api/healthz` | `{ "ok": true, "name": "noobty", "version": "..." }` |
+| GET | `/api/storage` | `{ "used_bytes", "max_total_bytes", "retention_days" }` |
+| GET | `/releases/shell/latest.json` | Tray updater (Tauri dynamic format). `200` `{ version, notes?, pub_date?, url, signature }` or **`204`** if no release staged. `url` is absolute using the request `Host`. |
+| GET | `/releases/shell/<file>` | Static NSIS installer / artifacts from `{storage}/releases/shell/`. |
 
 ## Streaming relay (M2)
 

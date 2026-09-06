@@ -103,6 +103,11 @@ async fn main() {
         .route("/api/files/{file_id}/meta", get(api::files::meta))
         .route("/api/files/{file_id}/thumb", get(api::thumbs::thumb))
         .route("/api/storage", get(api::storage_info))
+        .route("/releases/shell/latest.json", get(api::releases::latest))
+        .nest_service(
+            "/releases/shell",
+            ServeDir::new(state.blobs.releases_shell_dir()),
+        )
         .merge(upload_routes)
         .merge(relay_routes)
         .fallback_service(ServeDir::new(&state.cfg.web_dir))

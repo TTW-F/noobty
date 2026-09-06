@@ -13,6 +13,7 @@
     "core:webview:default",
     "notification:default",
     "autostart:default",
+    "updater:default",
     "allow-shell-commands"
   ]
 }

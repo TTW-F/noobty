@@ -5,7 +5,9 @@ Windows tray shell built with **Tauri 2**. It embeds the hub's web UI and adds:
 - system notifications on incoming transfers
 - auto-accept (save incoming files to a **configurable** receive directory; default `Downloads\Noobty`; tray + sidebar)
 - HTML5 drag-and-drop sending (Tauri's native file-drop handler is disabled so the web Composer receives drops)
-- tray: open window / change hub URL / autostart / quit — closing the window hides to tray
+- tray: open window / change hub URL / receive dir / autostart / **check for updates** / quit — closing the window hides to tray
+- **signed updates** from the hub (`GET /releases/shell/latest.json`); see [docs/RELEASING.md](../docs/RELEASING.md)
+- NSIS uninstall clears `%APPDATA%\noobty-shell` + autostart (receive folder kept)
 
 The shell does **not** have its own product UI — after first-run hub setup, everything visible is the hub's web page.
 
